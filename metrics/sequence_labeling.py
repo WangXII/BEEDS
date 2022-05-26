@@ -289,6 +289,24 @@ def f1_score(y_true, y_pred, average='micro', suffix=False):
 
     return score
 
+def stats(y_true, y_pred, average='micro', suffix=False):
+    """Get various stats about number correct, number predictions, number groundtruth.
+    Args:
+        y_true : 2d array. Ground truth (correct) target values.
+        y_pred : 2d array. Estimated targets as returned by a tagger.
+    """
+    true_entities = set(get_entities(y_true, suffix))
+    pred_entities = set(get_entities(y_pred, suffix))
+    # for true_entity, pred_entity in zip(true_entities, pred_entities):
+    #     print("True: {}".format(true_entity))
+    #     print("Predicted: {}".format(pred_entity))
+
+    nb_correct = len(true_entities & pred_entities)
+    nb_pred = len(pred_entities)
+    nb_true = len(true_entities)
+
+    return nb_correct, nb_pred, nb_true
+
 
 def accuracy_score(y_true, y_pred):
     """Accuracy classification score.

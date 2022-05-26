@@ -53,7 +53,7 @@ def substrate_condition(x):
 # substrate_condition = (i == 8)
 
 
-_, event_dict = IndraDataLoader.get_dataset(use_cache=True, mode="all", question_type=question_type, add_family_members=family_member_bool)
+_, event_dict = IndraDataLoader.get_dataset(use_cache=True, mode="all", question_type=question_type)
 
 breaking = False
 es = Elasticsearch()

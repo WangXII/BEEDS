@@ -163,9 +163,11 @@ class ModelForDistantSupervision(nn.Module):
                 # logger.warn(labels[24])
                 logger.warn(sequence_logits)
                 logger.warn(pos_sequence_mask)
-                logger.warn(positive_loss)
+                if pos_sequence_mask.any():
+                    logger.warn(positive_loss)
                 logger.warn(neg_sequence_mask)
-                logger.warn(negative_loss)
+                if neg_sequence_mask.any():
+                    logger.warn(negative_loss)
                 logger.warn(loss)
 
             outputs = (loss, active_sequence_logits, logits, crf_sequence)

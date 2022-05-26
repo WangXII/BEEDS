@@ -18,10 +18,17 @@ from enum import Enum
 from sqlalchemy import create_engine
 
 import indra.statements.statements as statements
-from data_processing.dict_of_triggers import TRIGGERS, AMINO_ACIDS, AMINO_ACIDS_ABBREVIATIONS, AMINO_ACIDS_STRINGS, get_chebi_names
-from configs import GENE_INFO_DB
 
-gene_info_engine = create_engine(GENE_INFO_DB)
+from configs import GENE_INFO_DB
+from data_processing.dict_of_triggers import TRIGGERS, AMINO_ACIDS, AMINO_ACIDS_ABBREVIATIONS, AMINO_ACIDS_STRINGS, get_chebi_names
+from util.build_ncbi_gene_id_db import get_gene_id_to_names
+
+import logging
+
+logger = logging.getLogger(__name__)
+
+CHEBI_NAMES = get_chebi_names()
+GENE_INFO_ENGINE = create_engine(GENE_INFO_DB)
 
 LABELS = ['O', 'X', 'B', 'I']
 PAD_TOKEN_LABEL_ID = -1
@@ -82,7 +89,8 @@ class Question(Enum):
     # Other
     EXPRESSION_CAUSE = 42
     EXPRESSION_COMPLEXCAUSE = 43
-    COMPLEX_PARTICIPANT = 44  # TODO: Implement in INDRA
+    COMPLEX_PAIR = 44
+    COMPLEX_MULTI = 74
     TRANSPORT_CAUSE = 45  # TODO: Implement in INDRA
     TRANSPORT_COMPLEXCAUSE = 46  # TODO: Implement in INDRA
     TRANSPORT_FROM = 47  # TODO: Implement in INDRA
@@ -179,7 +187,7 @@ TRIGGER_WORDS = {
     "EXPRESSION_COMPLEXCAUSE": TRIGGERS["Gene_expression"],
     "INHIBEXPRESSION_CAUSE": TRIGGERS["Gene_expression"],
     "INHIBEXPRESSION_COMPLEXCAUSE": TRIGGERS["Gene_expression"],
-    "COMPLEX_PARTICIPANT": TRIGGERS["Binding"],
+    "COMPLEX_PAIR": TRIGGERS["Binding"],
     "TRANSPORT_CAUSE": TRIGGERS["Transport"],
     "TRANSPORT_COMPLEXCAUSE": TRIGGERS["Transport"],
     "TRANSPORT_FROM": TRIGGERS["Transport"],
@@ -189,7 +197,8 @@ TRIGGER_WORDS = {
     "INHIBITION_CAUSE": TRIGGERS["Negative_regulation"],
     "INHIBITION_COMPLEXCAUSE": TRIGGERS["Negative_regulation"],
     "STATECHANGE_CAUSE": TRIGGERS["Positive_regulation"] + TRIGGERS["Negative_regulation"] + TRIGGERS["Regulation"],
-    "STATECHANGE_COMPLEXCAUSE": TRIGGERS["Positive_regulation"] + TRIGGERS["Negative_regulation"] + TRIGGERS["Regulation"]
+    "STATECHANGE_COMPLEXCAUSE": TRIGGERS["Positive_regulation"] + TRIGGERS["Negative_regulation"] + TRIGGERS["Regulation"],
+    "COMPLEX_MULTI": TRIGGERS["Binding"]
 }
 
 
@@ -254,7 +263,7 @@ QUESTION_TO_BIOPAX_TYPE = {
     "EXPRESSION_COMPLEXCAUSE": statements.IncreaseAmount,
     "INHIBEXPRESSION_CAUSE": statements.DecreaseAmount,
     "INHIBEXPRESSION_COMPLEXCAUSE": statements.DecreaseAmount,
-    "COMPLEX_PARTICIPANT": statements.Complex,
+    "COMPLEX_PAIR": statements.Complex,
     # "TRANSPORT_CAUSE": TRIGGERS["Transport"],
     # "TRANSPORT_COMPLEXCAUSE": TRIGGERS["Transport"],
     # "TRANSPORT_FROM": TRIGGERS["Transport"],
@@ -267,16 +276,14 @@ QUESTION_TO_BIOPAX_TYPE = {
     "GAP_CAUSE": statements.Gap,
     # "CONVERSION_PRODUCT": statements.Conversion,
     "STATECHANGE_CAUSE": statements.Phosphorylation,
-    "STATECHANGE_COMPLEXCAUSE": statements.Phosphorylation
+    "STATECHANGE_COMPLEXCAUSE": statements.Phosphorylation,
+    "COMPLEX_MULTI": statements.Complex,
 }
 
 
-QUESTION_TYPES = [0, 1, 2, 57, 3, 4, 5, 58, 6, 7, 8, 59, 9, 10, 11, 60, 18, 19, 20, 63, 21, 22, 23, 64,
-                  42, 43, 53, 71, 49, 50, 51, 52, 72, 73]
-QUESTION_TYPES_EVEX = [0, 1, 2, 57, 6, 7, 8, 59, 18, 19, 20, 63, 42, 43, 72, 73]
-COMPLEX_TYPES_MAPPING = {1: 0, 57: 0, 4: 3, 58: 3, 7: 6, 59: 6, 10: 9, 60: 9, 19: 18, 63: 18, 22: 21, 64: 21, 43: 42, 71: 53, 50: 49, 52: 51}
-# TODO: Add this mapping
-# COMPLEX_TYPES_MAPPING = {1: 0, 57: 0, 4: 3, 58: 3, 7: 6, 59: 6, 10: 9, 60: 9, 19: 18, 63: 18, 22: 21, 64: 21, 43: 42, 71: 53, 50: 49, 52: 51, 73: 72}
+QUESTION_TYPES = [0, 2, 57, 3, 5, 58, 6, 8, 59, 9, 11, 60, 18, 20, 63, 21, 23, 64, 42, 53, 49, 51, 72, 44, 74]
+QUESTION_TYPES_EVEX = [0, 2, 57, 6, 8, 59, 18, 20, 63, 42, 72, 44, 74]
+COMPLEX_TYPES_MAPPING = {57: 0, 58: 3, 59: 6, 60: 9, 63: 18, 64: 21, 74: 44}
 STATECHANGE_BIOPAX_TYPES = [
     statements.Phosphorylation, statements.Ubiquitination, statements.Dephosphorylation, statements.Acetylation,
     statements.Deubiquitination, statements.Methylation, statements.Sumoylation, statements.Deacetylation,
@@ -381,12 +388,58 @@ def parse_residue_position_string(res_pos_string):
         return "", ""
 
 
+class GeneIDToNames:
+    lookup_table = None  # Needs to be initialized with function initialize_geneid_to_names()
+
+    @classmethod
+    def initialize(cls):
+        logger.info("Loading GENE_ID_TO_NAMES")
+        cls.lookup_table = get_gene_id_to_names()
+
+
+def updateAllNames(all_names, name, db, identifier, gene_info_engine):
+    if GeneIDToNames.lookup_table is None:
+        GeneIDToNames.initialize()
+    if db == "EGID" and identifier in GeneIDToNames.lookup_table:  # Gene Info NCBI
+        # Alternative database
+        # sql_query = 'SELECT Symbol, Synonyms, description, Symbol_from_nomenclature_authority, Full_name_from_nomenclature_authority, ' \
+        #             'Other_designations FROM pubmed_annotations WHERE GeneID = "{}" LIMIT 1'.format(identifier)
+        # df = pd.read_sql_query(sql_query, gene_info_engine)
+        # for col in df.columns:
+        #     if df[col][0] != "-" and col in ["Symbol", "description", "Symbol_from_nomenclature_authority", "Full_name_from_nomenclature_authority"]:
+        #         all_names.add(df[col][0])
+        #     elif df[col][0] != "-" and col in ["Synonyms", "Other_designations"]:
+        #         all_names.update(df[col][0].split("|"))
+        # name = df["Symbol"][0]
+        all_names.update(GeneIDToNames.lookup_table[identifier][1])
+        name = GeneIDToNames.lookup_table[identifier][0]
+    elif db == "CHEBI" and identifier in CHEBI_NAMES:  # CheBI
+        # identifier = re.sub("[^0-9]", "", identifier)
+        all_names.update(CHEBI_NAMES[identifier])
+        name = CHEBI_NAMES[identifier][0]
+
+    # No matching DB ref
+    if db == "##" or identifier == "##":
+        db_id = {}
+    else:
+        db_id = {db: identifier}
+
+    return all_names, name, db_id
+
+
 def synonym_expansion(indra_agent, machine_reading=True, retrieval="standard"):
     if len(indra_agent.all_names) == 0 and "CHEBI" in indra_agent.db_refs:
         return get_chemical_synonyms(indra_agent)
     else:
         names = indra_agent.all_names
-        return shorten_synonym_list(names, machine_reading=machine_reading, retrieval=retrieval)
+        names.append(indra_agent.name)
+        if "EGID" in indra_agent.db_refs:
+            names, _, _ = updateAllNames(set(names), indra_agent.name, "EGID", indra_agent.db_refs["EGID"], None)
+        elif "EGID" not in indra_agent.db_refs and "UP" in indra_agent.db_refs:
+            eg_id = get_db_id(indra_agent)
+            if eg_id[0] == "EGID":
+                names, _, _ = updateAllNames(set(names), indra_agent.name, eg_id[0], eg_id[1], None)
+        return shorten_synonym_list(list(names), machine_reading=machine_reading, retrieval=retrieval)
 
 
 def get_subject_list(question_type, indra_subject_list):
@@ -410,7 +463,7 @@ def get_db_id(agent):
         db_id = ("EGID", agent.db_refs["EGID"])
     elif "UP" in agent.db_refs:
         df = pd.read_sql_query(('SELECT GeneID FROM up_to_geneid2 WHERE "UniProtKB-AC" = "{}" AND "NCBI-taxon" = "9606"'
-                                'LIMIT 1').format(agent.db_refs["UP"]), gene_info_engine)
+                                'LIMIT 1').format(agent.db_refs["UP"]), GENE_INFO_ENGINE)
         if len(df) == 0:
             id_number = ""
         else:
@@ -434,17 +487,44 @@ def convert_gene_to_human_gene_id(gene_id):
         return gene_id
 
     df = pd.read_sql_query('''SELECT "HID", "Taxonomy_ID", "Gene_ID" FROM homologene
-                           WHERE "Gene_ID" = {}'''.format(gene_id), gene_info_engine)
+                           WHERE "Gene_ID" = {}'''.format(gene_id), GENE_INFO_ENGINE)
     if len(df.head()) != 1:
         return gene_id
     hid = df["HID"][0]
 
     df = pd.read_sql_query('''SELECT "HID", "Taxonomy_ID", "Gene_ID" FROM homologene
-                           WHERE "HID" = {} AND "TAXONOMY_ID" = 9606'''.format(hid), gene_info_engine)
+                           WHERE "HID" = {} AND "TAXONOMY_ID" = 9606'''.format(hid), GENE_INFO_ENGINE)
     if len(df.head()) != 1:
         return gene_id
     return df["Gene_ID"][0]
 
 
+def parse_subject_strings(list_subject_strings):
+    theme_ids = []
+    for theme_subject in list_subject_strings[1:]:
+        theme_id = theme_subject.split("_")[-1]
+        if theme_id.isnumeric():
+            theme_id = ("EGID", theme_id)
+        elif theme_id != "##":
+            theme_id = ("CHEBI", theme_id)
+        elif theme_id == "##":
+            theme_id = ("##", theme_id)
+            bool_numeric = False
+        else:
+            raise ValueError("Unexpected theme id {}".format(theme_id))
+        theme_ids.append(theme_id)
+    if len(theme_ids) == 1:
+        theme_ids = theme_ids[0]
+    elif len(theme_ids) > 1:
+        theme_ids = tuple(theme_ids)
+    return theme_ids
+
+
 if __name__ == "__main__":
     print(Question.PHOSPHORYLATION_CAUSE.name)
+
+    name = "AKT1"
+    all_names = []
+    db_id = {"EGID": "207"}
+    indra_agent = statements.Agent(name, list(all_names), db_refs=db_id)
+    print(synonym_expansion(indra_agent, retrieval="relaxed"))

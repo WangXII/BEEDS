@@ -36,15 +36,15 @@ from tqdm import tqdm, trange
 from torch.utils.data import DataLoader, ConcatDataset
 from transformers import AdamW, WEIGHTS_NAME, AutoConfig
 
-from configs import PID_MODEL_FAMILIES, ModelHelper
+from configs import OWL_STATEMENTS, TQDM_DISABLE, ModelHelper
 from configs.parser import parse_arguments
 from data_processing.biopax_to_retrieval import IndraDataLoader
 from data_processing.datatypes import LABELS, Question, QUESTION_TYPES, COMPLEX_TYPES_MAPPING, PAD_TOKEN_LABEL_ID
 from metrics.eval import get_average_precision, visualize
-from metrics.sequence_labeling import precision_score, recall_score, f1_score  # , classification_report
+from metrics.sequence_labeling import precision_score, recall_score, f1_score, stats  # , classification_report
 from run.bert_model import ModelForDistantSupervision
 from run.roberta_model import ModelForDistantSupervision2
-from run.utils_io import load_and_cache_examples, save_model, set_seed
+from run.utils_io import DataBuilderLoader, save_model, set_seed
 from run.utils_run import update_with_nn_output, initialize_loaders, update_metadata, extract_from_nn_output, collate_fn
 
 
@@ -158,20 +158,29 @@ class Excecutor:
 
         # Build datasets
         if self.args.do_build_data:
-            data_loader.load_from_indra(self.question_types, self.args.train_data, datasplit="train")
-            data_loader.load_from_indra(self.question_types, self.args.dev_data, datasplit="eval")
-            data_loader.load_from_indra(self.question_types, self.args.test_data, datasplit="test")
+            data_loader.load_from_indra_and_bionlp(self.question_types, self.args.train_data, datasplit="train")
+            data_loader.load_from_indra_and_bionlp(self.question_types, self.args.dev_data, datasplit="eval")
+            data_loader.load_from_indra_and_bionlp(self.question_types, self.args.test_data, datasplit="test")
 
         # Training
         if self.args.do_train:
-            train_dataset, _, _ = data_loader.load_from_indra(self.question_types, self.args.train_data, datasplit="train")
+            train_dataset, train_direct_dataset, _, _ = data_loader.load_from_indra_and_bionlp(self.question_types, self.args.train_data, datasplit="train")
+            train_dataset = ConcatDataset(train_dataset)
+            train_direct_dataset = ConcatDataset(train_direct_dataset)
+            # exit()
             eval_datasplit = check_datastring(self.args.dev_data, "dev")
-            trainer.run(self.model, train_dataset, self.device, self.n_gpu, data_loader, evaluator, self.question_types, eval_datasplit)
+            trainer.run(self.model, train_dataset, train_direct_dataset, self.device,
+                        self.n_gpu, data_loader, evaluator, self.question_types, eval_datasplit)
 
         # Evaluation
         if self.args.do_eval and self.args.local_rank in [-1, 0]:
             eval_datasplit = check_datastring(self.args.dev_data, "dev")
-            _, eval_dataset, label_encoders = data_loader.load_from_indra(self.question_types, self.args.dev_data, datasplit=eval_datasplit)
+            if self.args.cache_predictions in [0, 1, 2]:
+                eval_dataset, eval_direct_dataset, distant_encoder, direct_encoder = data_loader.load_from_indra_and_bionlp(
+                    self.question_types, self.args.dev_data, datasplit=eval_datasplit)
+            else:
+                eval_dataset = eval_direct_dataset = distant_encoder = direct_encoder = [[] for i in range(25)]
+            number_questions = len(eval_dataset)
 
             # Load pretrained tokenizer (in model_helper) and model
             self.model_helper = ModelHelper(self.args.model_name_or_path, self.args.output_dir)
@@ -188,20 +197,32 @@ class Excecutor:
                     config=config, model_name=checkpoint, multi_instance_bool=self.args.multi_instance_learning,
                     multi_instance_bool_neg=self.args.multi_instance_learning_neg, crf_bool=self.args.crf)
                 self.model.to(self.device)
+                logger.info("Start evaluation for directly supervised data ...")
+                losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, _ = \
+                    evaluator.run(self.model, eval_direct_dataset, self.device, self.n_gpu, eval_datasplit,
+                                  checkpoint_prefix=global_step, label_encoders=direct_encoder, cache_predictions=0)
+                evaluator.evaluate_nn(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses,
+                                      supervision="Direct", checkpoint_prefix=global_step,
+                                      visualize_bool=self.args.visualize_preds)
+                logger.info("Start evaluation for distantly supervised data ...")
                 losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events = \
                     evaluator.run(self.model, eval_dataset, self.device, self.n_gpu, eval_datasplit,
-                                  checkpoint_prefix=global_step, label_encoders=label_encoders,
+                                  checkpoint_prefix=global_step, label_encoders=distant_encoder,
                                   cache_predictions=self.args.cache_predictions)
-                evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions,
-                                   eval_datasplit, losses, checkpoint_prefix=global_step, visualize_bool=self.args.visualize_preds)
+                evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses,
+                                   checkpoint_prefix=global_step, visualize_bool=self.args.visualize_preds)
                 if self.args.multiturn:
                     logger.info("Start multiturn evaluation...")
-                    _, eval_dataset, label_encoders = data_loader.load_from_prior_answers(self.question_types, indra_events)
+                    del eval_dataset
+                    _, eval_dataset, label_encoders = data_loader.load_from_prior_answers(
+                        self.question_types, indra_events, self.args.dev_data, datasplit=eval_datasplit, cache=False)
                     losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events = \
                         evaluator.run(self.model, eval_dataset, self.device, self.n_gpu, eval_datasplit,
-                                      checkpoint_prefix=global_step, label_encoders=label_encoders)
+                                      checkpoint_prefix=global_step, label_encoders=label_encoders,
+                                      cache_predictions=1, offset=number_questions)
                     evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions,
-                                       eval_datasplit, losses, checkpoint_prefix=global_step, visualize_bool=self.args.visualize_preds)
+                                       eval_datasplit, losses, checkpoint_prefix=global_step, visualize_bool=self.args.visualize_preds,
+                                       wandb_log=False)
 
         # Prediction
         if self.args.do_predict and self.args.local_rank in [-1, 0]:
@@ -235,47 +256,73 @@ class DatasetLoader:
     def __init__(self, args, model_helper, labels, pad_token_label_id):
         self.dataset = None
         self.dataset_array = []
+        self.direct_dataset_array = []
         self.label_encoders = []
         self.args = args
         self.model_helper = model_helper
         self.labels = labels
         self.pad_token_label_id = pad_token_label_id
+        self.loader = DataBuilderLoader(self.args, self.model_helper, self.labels, self.pad_token_label_id)
 
-    def load_from_indra(self, question_types, dataset_name, datasplit, cache=True):
-        ''' Load datasets from INDRA '''
+    def load_from_indra_and_bionlp(self, question_types, dataset_name, datasplit, cache=True):
+        ''' Load distantly supervised datasets from INDRA and directly supervised data from BioNLP '''
         self.dataset_array = []
-        self.label_encoders = []
+        self.distant_encoder = []
 
+        # Distantly supervised INDRA/PID dataset
         for i, question_type in enumerate(question_types):
-            _, event_dict = IndraDataLoader.get_dataset(mode=datasplit, question_type=question_type, biopax_model_str=PID_MODEL_FAMILIES)
+            _, event_dict = IndraDataLoader.get_dataset(mode=datasplit, question_type=question_type, biopax_model_str=OWL_STATEMENTS)
             if event_dict is not None:
-                dataset, subject_label_encoder = load_and_cache_examples(
-                    self.args, self.model_helper, self.labels, self.pad_token_label_id, dataset_name, event_dict, question_type, cache=cache)
+                dataset, distant_subject_encoder = self.loader.load_and_cache_examples(dataset_name, event_dict, question_type, cache=cache)
                 # logger.info(len(dataset))
                 # logger.info(dataset[0])
                 self.dataset_array.append(dataset)
-                self.label_encoders.append(subject_label_encoder)
+                self.distant_encoder.append(distant_subject_encoder)
 
-        self.dataset = ConcatDataset(self.dataset_array)
-        return self.dataset, self.dataset_array, self.label_encoders
+        # Directly supervised BioNLP dataset
+        self.direct_dataset_array = []
+        self.direct_encoder = []
+        for i, question_type in enumerate(question_types):
+            dataset, direct_subject_encoder = self.loader.load_and_cache_direct_examples(
+                self.args.direct_data, question_type, datasplit, cache=cache, add_negative_examples=self.args.negative_examples)
+            # logger.info(len(dataset))
+            # logger.info(dataset[0])
+            if len(dataset) > 0:
+                logger.debug("Build direct data")
+                logger.debug(question_type)
+                logger.debug(len(dataset))
+                self.direct_dataset_array.append(dataset)
+                self.direct_encoder.append(direct_subject_encoder)
 
-    def load_from_prior_answers(self, question_types, prior_events):
+        return self.dataset_array, self.direct_dataset_array, self.distant_encoder, self.direct_encoder
+
+    def load_from_prior_answers(self, question_types, prior_events, dataset_name, datasplit=None, true_subset=True, cache=False):
         ''' Build datasets from prior events for multi-turn questions. '''
         self.dataset_array = []
         self.label_encoders = []
 
         for i, question_type in enumerate(question_types):
             if question_type.value in COMPLEX_TYPES_MAPPING.keys():
+                # logger.info(question_type.value)
+                # logger.info(prior_events.keys())
                 prior_question_type = Question(COMPLEX_TYPES_MAPPING[question_type.value])
-                prior_event_dict = prior_events[prior_question_type.name]
-                if len(prior_event_dict) > 0:
-                    dataset, subject_label_encoder = load_and_cache_examples(
-                        self.args, self.model_helper, self.labels, self.pad_token_label_id, "dataset",
-                        prior_event_dict, question_type, cache=False, predict_bool=True)
-                    # logger.info(len(dataset))
-                    # logger.info(dataset[0])
-                    self.dataset_array.append(dataset)
-                    self.label_encoders.append(subject_label_encoder)
+                if prior_question_type.name in prior_events:
+                    # logger.info(prior_question_type.name)
+                    prior_event_dict = prior_events[prior_question_type.name]
+                    logger.info(prior_question_type.name)
+                    logger.info(len(prior_event_dict))
+                    if true_subset:
+                        _, event_dict = IndraDataLoader.get_dataset(mode=datasplit, question_type=question_type, biopax_model_str=OWL_STATEMENTS)
+                        prior_event_keys = event_dict.keys() & prior_event_dict.keys()
+                        prior_event_dict = {k: prior_event_dict[k] for k in prior_event_keys}
+                    logger.info(len(prior_event_dict))
+                    if len(prior_event_dict) > 0:
+                        dataset, distant_subject_encoder = self.loader.load_and_cache_examples(
+                            "multiturn_" + dataset_name, prior_event_dict, question_type, cache=cache, predict_bool=True)
+                        # logger.info(len(dataset))
+                        # logger.info(dataset[0])
+                        self.dataset_array.append(dataset)
+                        self.label_encoders.append(distant_subject_encoder)
 
         self.dataset = ConcatDataset(self.dataset_array)
         return self.dataset, self.dataset_array, self.label_encoders
@@ -307,13 +354,12 @@ class DatasetLoader:
             event_dict = IndraDataLoader.get_custom_dataset(question_type=question_type)
             logger.info(event_dict)
             if event_dict is not None:
-                dataset, subject_label_encoder = load_and_cache_examples(
-                    self.args, self.model_helper, self.labels, self.pad_token_label_id, dataset_name, event_dict, question_type,
-                    False, True)
+                dataset, distant_subject_encoder = self.loader.load_and_cache_examples(
+                    dataset_name, event_dict, question_type, False, True)
                 # logger.info(len(dataset))
                 # logger.info(dataset[0])
                 self.dataset_array.append(dataset)
-                self.label_encoders.append(subject_label_encoder)
+                self.label_encoders.append(distant_subject_encoder)
 
         # self.dataset = ConcatDataset(self.dataset_array)
         # return self.dataset, self.dataset_array, self.label_encoders
@@ -335,8 +381,11 @@ class Trainer(ModelRunner):
     def __init__(self, args, model_helper, labels, pad_token_label_id):
         super(Trainer, self).__init__(args, model_helper, labels, pad_token_label_id)
 
-    def run(self, model, dataset, device, n_gpu, data_loader, evaluator, question_types, eval_datasplit):
+    def run(self, model, dataset, direct_dataset, device, n_gpu, data_loader, evaluator, question_types, eval_datasplit):
         """ Model trainer """
+
+        # for feature in dataset:
+        #     logger.info("Length {}".format(feature["input_ids"].size()))
 
         if os.path.exists(self.args.output_dir) and os.listdir(self.args.output_dir) and not self.args.overwrite_output_dir:
             raise ValueError("Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(self.args.output_dir))
@@ -349,7 +398,7 @@ class Trainer(ModelRunner):
             {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0}
         ]
         optimizer = AdamW(optimizer_grouped_parameters, lr=self.args.learning_rate, eps=self.args.adam_epsilon)
-        train_dataloader, scheduler = initialize_loaders(self.args, dataset, optimizer, n_gpu)
+        train_dataloader, train_direct_dataloader, scheduler = initialize_loaders(self.args, dataset, direct_dataset, optimizer)
 
         if self.args.fp16:
             scaler = torch.cuda.amp.GradScaler()
@@ -377,6 +426,16 @@ class Trainer(ModelRunner):
         train_iterator = trange(int(self.args.num_train_epochs), desc="Epoch", disable=self.args.local_rank not in [-1, 0])
         set_seed(self.args, n_gpu)  # Added here for reproductibility (even between python 2 and 3)
 
+        # If using auxillary directly supervised data, draw random permutation of either dataset
+        # 0 for distantly supervised, 1 for directly supervised data
+        if self.args.use_directly_supervised_data and self.args.use_distantly_supervised_data:
+            dataset_choice = [0] * len(train_dataloader) + [1] * len(train_direct_dataloader)
+        elif self.args.use_directly_supervised_data:
+            dataset_choice = [1] * len(train_direct_dataloader)
+        else:
+            dataset_choice = [0] * len(train_dataloader)
+        np.random.shuffle(dataset_choice)
+
         # "pubmed_ids": torch.tensor(self.features[index].pubmed_id, dtype=torch.long),
         # "whitespace_bools": torch.tensor(self.features[index].whitespace_bools, dtype=torch.bool),
         # "position_ids": torch.tensor(self.features[index].position_ids, dtype=torch.long),
@@ -388,13 +447,24 @@ class Trainer(ModelRunner):
 
         for iteration in train_iterator:
             logger.info("  Iteration = %d", iteration)
-            epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=self.args.local_rank not in [-1, 0])
-            for step, batch in enumerate(epoch_iterator):
-
+            epoch_iterator = tqdm(dataset_choice, desc="Iteration", disable=self.args.local_rank not in [-1, 0] or TQDM_DISABLE)
+            distant_data_iterator = iter(train_dataloader)
+            direct_data_iterator = iter(train_direct_dataloader)
+            logger.debug(dataset_choice)
+            logger.info("Length distantly supervised data = {}".format(len(distant_data_iterator)))
+            logger.info("Length directly supervised data = {}".format(len(direct_data_iterator)))
+            for step, dataset_index in enumerate(epoch_iterator):
+                logger.debug("Step {} with {}".format(step, dataset_index))
+                # Get current batch
+                if dataset_index == 0:
+                    batch = next(distant_data_iterator)
+                else:  # dataset_index == 1
+                    batch = next(direct_data_iterator)
                 # Prepare Batch
                 pad_sequences = torch.any(batch["attention_mask"], 1)
                 pad_seq_id = (pad_sequences.long() == 1).sum()
                 batch = {k: v[:pad_seq_id].to(device) for i, (k, v) in enumerate(batch.items()) if i <= 3}
+                # logger.info(len(batch["input_ids"]))
 
                 # Forward Pass
                 if self.args.fp16:
@@ -407,7 +477,13 @@ class Trainer(ModelRunner):
                 logit_hist = logit_hist.detach().cpu().numpy()
                 logit_hist = np.nan_to_num(logit_hist)
 
-                assert loss.item() not in [float("inf"), float("-inf")] and not math.isnan(loss.item())  # Padding examples with infinite loss
+                if loss.item() in [float("inf"), float("-inf")] or math.isnan(loss.item()):
+                    logger.warn("Encountered invalid loss. Continue with next batch.")
+                    continue
+
+                # If directly supervised data, scale loss accordingly
+                if dataset_index == 1:
+                    loss = self.args.direct_weight * loss
 
                 # Backward Pass
                 if self.args.fp16:
@@ -448,19 +524,31 @@ class Trainer(ModelRunner):
 
             # Evaluate eval set in prediction settings
             if self.args.local_rank in [-1, 0] and self.args.evaluate_during_training:
-                _, eval_dataset, label_encoders = data_loader.load_from_indra(question_types, self.args.dev_data, datasplit=eval_datasplit)
+                eval_dataset, eval_direct_dataset, distant_encoder, direct_encoder = data_loader.load_from_indra_and_bionlp(
+                    question_types, self.args.dev_data, datasplit=eval_datasplit)
+                number_questions = len(eval_dataset)
+                logger.info("Start evaluation for directly supervised data ...")
+                losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events = \
+                    evaluator.run(model, eval_direct_dataset, device, n_gpu, eval_datasplit, train_model=True,
+                                  checkpoint_prefix=global_step, label_encoders=direct_encoder, cache_predictions=0)
+                evaluator.evaluate_nn(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses,
+                                      supervision="Direct", checkpoint_prefix=global_step)
+                logger.info("Start evaluation for distantly supervised data ...")
                 losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events = \
                     evaluator.run(model, eval_dataset, device, n_gpu, eval_datasplit, train_model=True,
-                                  checkpoint_prefix=global_step, label_encoders=label_encoders,
+                                  checkpoint_prefix=global_step, label_encoders=distant_encoder,
                                   cache_predictions=self.args.cache_predictions)
                 evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses, checkpoint_prefix=global_step)
                 if self.args.multiturn:
-                    logger.info("Start multiturn evaluation...")
-                    _, eval_dataset, label_encoders = data_loader.load_from_prior_answers(question_types, indra_events)
+                    logger.info("Start multiturn evaluation ...")
+                    del eval_dataset
+                    _, eval_dataset, label_encoders = data_loader.load_from_prior_answers(question_types, indra_events, datasplit=eval_datasplit)
                     losses, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events = \
                         evaluator.run(model, eval_dataset, device, n_gpu, eval_datasplit, train_model=True,
-                                      checkpoint_prefix=global_step, label_encoders=label_encoders)
-                    evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses, checkpoint_prefix=global_step)
+                                      checkpoint_prefix=global_step, label_encoders=label_encoders,
+                                      cache_predictions=self.args.cache_predictions, offset=number_questions)
+                    evaluator.evaluate(nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, eval_datasplit, losses, checkpoint_prefix=global_step,
+                                       wandb_log=False)
                 logger.info("Finished evaluating")
                 model.train()
 
@@ -481,7 +569,7 @@ class Evaluator(ModelRunner):
         super(Evaluator, self).__init__(args, model_helper, labels, pad_token_label_id)
 
     def run(self, model, dataset, device, n_gpu, datasplit, train_model=False, checkpoint_prefix="",
-            label_encoders=None, output_cache_file=None, cache_predictions=0):
+            label_encoders=None, output_cache_file=None, cache_predictions=0, offset=0):
         ''' Evaluate a dataset. '''
         events_dict = {}
         kb_groundtruth = []
@@ -490,8 +578,9 @@ class Evaluator(ModelRunner):
         nn_predictions = []
         losses = []
         for i, question_dataset in enumerate(dataset):
+            question_number = i + offset
             loss, nn_ground, nn_pred, kb_ground, kb_pred, indra_events = \
-                self.run_question_type(model, question_dataset, device, n_gpu, datasplit, i, train_model, checkpoint_prefix,
+                self.run_question_type(model, question_dataset, device, n_gpu, datasplit, question_number, train_model, checkpoint_prefix,
                                        label_encoder=label_encoders[i], output_cache_file=output_cache_file,
                                        cache_predictions=cache_predictions)
             events_dict = {**events_dict, **indra_events}
@@ -541,7 +630,9 @@ class Evaluator(ModelRunner):
                 return eval_loss, {}, {}, {}, {}, {}
 
             description = "Evaluating" if self.args.do_predict is False else "Predicting"
-            for batch in tqdm(eval_dataloader, desc=description):
+            if TQDM_DISABLE:
+                logger.info(description)
+            for batch in tqdm(eval_dataloader, desc=description, disable=TQDM_DISABLE):
                 pad_sequences = torch.any(batch["attention_mask"], 1)
                 pad_seq_id = (pad_sequences.long() == 1).sum()
 
@@ -573,6 +664,7 @@ class Evaluator(ModelRunner):
 
         elif cache_predictions == 2:
             filename = self.args.cache_dir + "/nn_output_question_" + str(question_type) + self.args.predictions_suffix + ".npz"
+            logger.info("Load cached output from {}".format(filename))
             if not os.path.exists(filename):
                 return -1, [], [], {}, {}, {}
             npzcache = np.load(filename, allow_pickle=True)
@@ -586,6 +678,7 @@ class Evaluator(ModelRunner):
                 preds, out_label_ids, out_token_ids, subjects, subject_lengths, pubmed_ids, whitespace_bools, position_ids,
                 question_ids, all_preds, attention_masks, question_types_ex, out_debug_label_ids, out_blinded_token_ids, output_cache_file,
                 cache_predictions)
+        # logger.info(len(indra_events))
 
         return eval_loss, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, indra_events
 
@@ -601,14 +694,17 @@ class Evaluator(ModelRunner):
         else:
             filename = output_cache_file
 
-        if cache_predictions in [0, 1, 2]:
+        if cache_predictions in [0, 1]:
             logger.debug(len(preds))
             logger.debug(len(preds[0]))
             # preds = preds.reshape(out_label_ids.shape[0], out_label_ids.shape[1], preds.shape[2])
             # preds = np.argmax(preds, axis=2)
             # preds = np.array(preds)
             # Pad sequences smaller than max_seq_length
-            preds = np.array([xi + [0] * (self.args.max_seq_length - len(xi)) for xi in preds])
+            try:
+                preds = np.array([xi + [0] * (self.args.max_seq_length - len(xi)) for xi in preds])
+            except ValueError:
+                preds = np.array([xi + [0] * (self.args.max_seq_length - len(xi)) for xi in preds.tolist()])
             out_label_ids = out_label_ids.reshape(preds.shape[0], preds.shape[1])
 
             # logger.info(out_label_ids)
@@ -656,8 +752,8 @@ class Evaluator(ModelRunner):
 
         return out_label_list, preds_list, groundtruth, predictions, indra_preds
 
-    def evaluate(self, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, datasplit, losses, checkpoint_prefix="",
-                 visualize_bool=False):
+    def evaluate(self, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, datasplit, losses, supervision="Distant", checkpoint_prefix="",
+                 visualize_bool=False, wandb_log=True):
         ''' Evaluate the results and calculate the performance metrics '''
         results = {
             "loss": np.mean(losses),
@@ -673,25 +769,73 @@ class Evaluator(ModelRunner):
         for key in sorted(results.keys()):
             logger.info("  %s = %s", key, str(results[key]))
 
-        if self.args.wandb:
+        if self.args.wandb and wandb_log:
             for key in sorted(results.keys()):
-                if key == "nn_f1":
-                    wandb.log({"NN_F1_{}_0".format(datasplit): results[key]})
-                elif key == "nn_recall":
-                    wandb.log({"NN_Recall_{}_0".format(datasplit): results[key]})
-                elif key == "nn_precision":
-                    wandb.log({"NN_Precision_{}_0".format(datasplit): results[key]})
-                elif key == "loss":
-                    wandb.log({"Eval_Loss_{}".format(datasplit): results[key]})
+                # if key == "nn_f1":
+                #     wandb.log({"NN_F1_{}_{}".format(datasplit, supervision): results[key]})
+                # elif key == "nn_recall":
+                #     wandb.log({"NN_Recall_{}_{}".format(datasplit, supervision): results[key]})
+                # elif key == "nn_precision":
+                #     wandb.log({"NN_Precision_{}_{}".format(datasplit, supervision): results[key]})
+                # elif key == "loss":
+                if key == "loss":
+                    wandb.log({"Eval_Loss_{}_{}".format(datasplit, supervision): results[key]})
                 elif key == "kb_average_precision":
                     for i, question_type_results in enumerate(results[key]):
                         qa_type = question_type_results[5]
-                        if qa_type in [" All", "PHOSPHORYLATION_CAUSE", "PHOSPHORYLATION_COMPLEXCAUSE"]:
-                            wandb.log({"Average_Precision_(Total)_{}_{}".format(datasplit, qa_type): question_type_results[0]})
-                            wandb.log({"Recall_(Total)_{}_{}".format(datasplit, qa_type): question_type_results[1]})
-                            wandb.log({"Precision_(Total)_{}_{}".format(datasplit, qa_type): question_type_results[2]})
-                            wandb.log({"F1_(Total)_{}_{}".format(datasplit, qa_type): question_type_results[3]})
-                            wandb.log({"Number_Preds_(Total)_{}_{}".format(datasplit, qa_type): question_type_results[4]})
+                        if qa_type in [" All"]:
+                            wandb.log({"KB_Average_Precision_{}_{}_{}".format(datasplit, qa_type, supervision): question_type_results[0]})
+                            wandb.log({"KB_Recall_{}_{}_{}".format(datasplit, qa_type, supervision): question_type_results[1]})
+                            wandb.log({"KB_Precision_{}_{}_{}".format(datasplit, qa_type, supervision): question_type_results[2]})
+                            wandb.log({"KB_F1_{}_{}_{}".format(datasplit, qa_type, supervision): question_type_results[3]})
+                            wandb.log({"KB_Number_Preds_{}_{}_{}".format(datasplit, qa_type, supervision): question_type_results[4]})
+
+    def evaluate_nn(self, nn_groundtruth, nn_predictions, kb_groundtruth, kb_predictions, datasplit, losses, supervision="Distant", checkpoint_prefix="",
+                    visualize_bool=False):
+        ''' Evaluate the results and calculate the performance metrics. Only evaluate NN part and not knowledge base part.
+            Used for evaluation of directly supervised data.
+        '''
+
+        # Visualize
+        if visualize_bool:
+            visualize_bionlp = get_average_precision(kb_groundtruth, kb_predictions, mode=datasplit, use_db_ids=True,
+                                                     visualize_bool=visualize_bool, only_visualize=True)
+            next(visualize_bionlp)
+
+        results = []
+        results_all = [0, 0, 0]
+        for i in range(len(nn_groundtruth)):
+            question_type_string = list(kb_groundtruth[i].values())[0][0][0][0]
+            results.append(("Precision {}".format(question_type_string), precision_score(nn_groundtruth[i], nn_predictions[i])))
+            results.append(("Recall {}".format(question_type_string), recall_score(nn_groundtruth[i], nn_predictions[i])))
+            results.append(("F1 {}".format(question_type_string), f1_score(nn_groundtruth[i], nn_predictions[i])))
+            nb_events = stats(nn_groundtruth[i], nn_predictions[i])
+            results_all[0] += nb_events[0]
+            results_all[1] += nb_events[1]
+            results_all[2] += nb_events[2]
+            results.append(("Stats (Correct, Predicted, Truth) {}".format(question_type_string), nb_events))
+        precision_all = results_all[0] / results_all[1]
+        recall_all = results_all[0] / results_all[2]
+        f1_all = 2 * (precision_all * recall_all) / (precision_all + recall_all)
+        results.append(("Precision All", precision_all))
+        results.append(("Recall All", recall_all))
+        results.append(("F1 All", f1_all))
+        results.append(("Stats (Correct, Predicted, Truth) All", results_all))
+
+        logger.info("***** Eval results %s *****", checkpoint_prefix)
+        logger.info("Bio NLP (directly supervised) data")
+        for key in results:
+            logger.info("  %s = %s", key[0], str(key[1]))
+        logger.info("*****")
+
+        if self.args.wandb:
+            for key in results:
+                if key[0] == "F1 All":
+                    wandb.log({"BioNLP_F1_{}_{}".format(datasplit, supervision): key[1]})
+                elif key[0] == "Recall All":
+                    wandb.log({"BioNLP_Recall_{}_{}".format(datasplit, supervision): key[1]})
+                elif key[0] == "Precision All":
+                    wandb.log({"BioNLP_Precision_{}_{}".format(datasplit, supervision): key[1]})
 
 
 if __name__ == "__main__":

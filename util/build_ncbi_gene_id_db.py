@@ -1,13 +1,24 @@
 ''' Read PubTator Annotations into a SQLite Database for further processing '''
 
+import os
+import sys
+
+if os.name == 'nt':
+    root_path = "/".join(os.path.realpath(__file__).split("\\")[:-2])
+else:
+    root_path = "/".join(os.path.realpath(__file__).split("/")[:-2])
+if root_path not in sys.path:
+    sys.path.append(root_path)
+
 from pathlib import Path
 from sqlalchemy import create_engine
+from sqlitedict import SqliteDict
 from tqdm import tqdm
 
 import pandas as pd
 import pickle
 
-from configs import GENE_INFO_DB, NCBI_GENE_INFO_FILE, GENE_ID_TO_NAMES_DB, LOAD_ID_GENE_NAMES_BOOL
+from configs import GENE_INFO_DB, GENE_NAMES_CACHE, NCBI_GENE_INFO_FILE, GENE_ID_TO_NAMES_DB, LOAD_ID_GENE_NAMES_BOOL
 
 
 def build_ncbi_gene_id_db():
@@ -87,11 +98,26 @@ def get_gene_id_to_names(use_cache=True, load_bool=True):
     return gene_id_to_names
 
 
+def dump_into_sqlite_dict():
+    with open(GENE_ID_TO_NAMES_DB, 'rb') as handle:
+        gene_id_to_names = pickle.load(handle)
+    gene_names_sql_dict = SqliteDict(GENE_NAMES_CACHE, tablename='gene_id_to_names', flag='w', autocommit=False)
+    gene_names_sql_dict.update(gene_id_to_names.items())
+    gene_names_sql_dict.commit()
+    gene_names_sql_dict.close()
+
+def load_into_sqlite_dict():
+    return SqliteDict(GENE_NAMES_CACHE, tablename='gene_id_to_names', flag='r', autocommit=False)
+
+
 # Main
 if __name__ == "__main__":
-    build_ncbi_gene_id_db()
+    dump_into_sqlite_dict()
 
-    disk_engine = create_engine(GENE_INFO_DB)
+    # Build data
+    # build_ncbi_gene_id_db()
+
+    # disk_engine = create_engine(GENE_INFO_DB)
 
     # # Create index
     # import sqlalchemy
@@ -110,9 +136,9 @@ if __name__ == "__main__":
     # inspector = reflection.Inspector.from_engine(disk_engine)
     # print(inspector.get_indexes('pubmed_annotations'))
 
-    df = pd.read_sql_query('SELECT GeneID, Symbol, Synonyms, description FROM pubmed_annotations '
-                           'WHERE GeneID = 210789 LIMIT 3', disk_engine)
-    print(df.head())
+    # df = pd.read_sql_query('SELECT GeneID, Symbol, Synonyms, description FROM pubmed_annotations '
+    #                        'WHERE GeneID = 210789 LIMIT 3', disk_engine)
+    # print(df.head())
 
     # gene_id_to_names = get_gene_id_to_names(use_cache=False)
     # print(gene_id_to_names["210789"])

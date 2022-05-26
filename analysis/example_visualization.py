@@ -15,10 +15,12 @@ from typing import List, Tuple, Set
 import logging
 import numpy as np
 import random
+import bisect
 
 # from data_processing.biopax_to_retrieval import IndraDataLoader
 # from data_processing.datatypes import Question
 from configs import NN_CACHE  # , PID_MODEL_FAMILIES
+from run.utils_run import TextHighlighter
 import metrics.eval as util
 
 logger = logging.getLogger(__name__)
@@ -28,12 +30,12 @@ logger.setLevel(logging.INFO)
 class ExampleVisualizer():
 
     def __init__(self, cached_file=None, groundtruth=None, predictions=None,
-                 indra_event_dict=None, groundtruth_type="annotations"):
+                 groundtruth_event_dict=None, prediction_event_dict=None):
         self.cached_file = cached_file
         self.groundtruth_by_pubmed_id = groundtruth
         self.predictions_by_pubmed_id = predictions
-        self.groundtruth_by_entities = indra_event_dict
-        self.groundtruth_type = groundtruth_type
+        self.groundtruth_by_entities = groundtruth_event_dict
+        self.predictions_by_entities = prediction_event_dict
         self._load_cached_file()
 
     def _load_cached_file(self):
@@ -42,9 +44,10 @@ class ExampleVisualizer():
             groundtruth, predictions, _, _, _ = [npzcache[array] for array in npzcache.files]
             self.groundtruth_by_pubmed_id = [groundtruth.item()]
             self.predictions_by_pubmed_id = [predictions.item()]
-        self.predictions_by_entities = util.convert_answers_from_docs_to_entities(self.predictions_by_pubmed_id, bool_return_docs=True)
-        if self.groundtruth_type == "annotations":
+        if self.groundtruth_by_entities is None:
             self.groundtruth_by_entities = util.convert_answers_from_docs_to_entities(self.groundtruth_by_pubmed_id, bool_return_docs=True)
+        if self.predictions_by_entities is None:
+            self.predictions_by_entities = util.convert_answers_from_docs_to_entities(self.predictions_by_pubmed_id, bool_return_docs=True)
 
     def _group_by_key(self, pair_list):
         entity_dict = {}
@@ -82,7 +85,7 @@ class ExampleVisualizer():
             logger.info(row_format.format(*row_list))
         logger.info(row_format.format("TOTAL", total_groundtruth, total_predictions, total_intersection))
 
-    def visualize_predictions(self, mode="all", number=10, sampling_method="top", question_subject=None, evidence_preds=False):
+    def visualize_predictions(self, mode="all", number=10, question_subjects=None):
         """ Visualizes neural network predictions based on the confidence.
         Parameters
         ----------
@@ -101,96 +104,84 @@ class ExampleVisualizer():
         ground_qa_pairs, pred_qa_pairs = self.get_entity_questions_answers()
         if mode == "all":
             qa_pairs = pred_qa_pairs
-            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subject)
-            evidence_list = self.get_list_of_evidence(qa_pairs, self.predictions_by_entities, question_subject)
+            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subjects)
+            # qa_pairs = ground_qa_pairs
+            # qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.groundtruth_by_entities, question_subjects)
         elif mode == "true_positives":
             qa_pairs = pred_qa_pairs & ground_qa_pairs
-            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subject)
-            evidence_list = self.get_list_of_evidence(qa_pairs, self.predictions_by_entities, question_subject)
+            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subjects)
         elif mode == "false_positives":
             qa_pairs = pred_qa_pairs - (pred_qa_pairs & ground_qa_pairs)
-            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subject)
-            evidence_list = self.get_list_of_evidence(qa_pairs, self.predictions_by_entities, question_subject)
+            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.predictions_by_entities, question_subjects)
         elif mode == "false_negatives":
             qa_pairs = ground_qa_pairs - (pred_qa_pairs & ground_qa_pairs)
-            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.groundtruth_by_entities, question_subject)
-            evidence_list = self.get_list_of_evidence(qa_pairs, self.groundtruth_by_entities, question_subject)
+            qa_pairs_with_evidence = self.get_pairs_with_evidence(qa_pairs, self.groundtruth_by_entities, question_subjects)
         else:
             raise ValueError("Wrong mode string!")
 
-        # if sampling_method == "top":
-        #     sorted_qa_pairs = sorted(qa_pairs_with_evidence, key=lambda x: x[1][0], reverse=True)  # Sort by descending confidence
-        # else:  # Sampling method is random
         sorted_qa_pairs = random.sample(qa_pairs_with_evidence, len(qa_pairs_with_evidence))
-        if sampling_method == "random":
-            top_pairs = sorted_qa_pairs[:number]
-        else:  # Sampling method is top
-            event_dict = {}
-            top_pairs = []
-            for pair in sorted_qa_pairs:
-                event_type = pair[0][0][0]
-                event_dict.setdefault(event_type, 0)
-                if event_dict[event_type] <= number:
-                    top_pairs.append(pair)
-                    event_dict[event_type] += 1
+        questions_with_substrates = []
+        event_dict = {}
+        top_pairs = []
+        for pair in sorted_qa_pairs:
+            event_type = pair[0][0]
+            event_dict.setdefault(event_type, 0)
+            if event_dict[event_type] < number:
+                top_pairs.append(pair)
+            event_dict[event_type] += 1
+
+        # Sort by event type
+        top_pairs = sorted(top_pairs, key=lambda x: x[0][0])
+
         logger.info(" ------------------------------------------------------------ ")
         logger.info(" RELATION PREDICTIONS ")
         # logger.info("Maximum Confidence: {}".format(sorted_qa_pairs[0][1][0]))
         # logger.info("Minimum Confidence: {}".format(sorted_qa_pairs[-1][1][0]))
+        text_highlighter = TextHighlighter()
         for i, pair in enumerate(top_pairs):
-            logger.info("  **** Example {} ****".format(i))
-            logger.info("Substrate: {}".format(pair[0][0]))
-            logger.info("Kinase: {}".format(pair[0][1]))
-            logger.info("")
-            for j, evidence in enumerate(pair[1]):
-                logger.info(" Evidence Number {}".format(j))
-                logger.info("Synonyms: {}, Confidence: {}, PubMed ID: {}".format(evidence[0], evidence[1], evidence[2]))
-                logger.info(" Text Evidence: {}".format(evidence[3]))
+            logger.info("  ** Sample Question {} **".format(i))
+            logger.info("Substrate: {}".format(pair[0]))
+            questions_with_substrates.append(pair[0])
+            for j, (kinase, evidences) in enumerate(pair[1].items()):
+                logger.info("  ** KB Answer {} **".format(j))
+                logger.info("Kinase: {}".format(kinase))
                 logger.info("")
+                sorted_evidences = sorted(evidences, key= lambda x: x[1], reverse=True)
+                for k, evidence in enumerate(sorted_evidences):
+                    logger.info(" Evidence Number {}".format(k))
+                    logger.info("Synonyms: {}, Confidence: {}, PubMed ID: {}".format(evidence[0], evidence[1], evidence[2]))
+                    if type(evidence[3]) == list:
+                        highlighted_text = text_highlighter.highlight_text(*evidence[3])
+                        logger.info(" Text Evidence: {}".format(highlighted_text))
+                    else:
+                        logger.info(" Text Evidence: {}".format(evidence[3]))
+                    logger.info("")
+                    if k >= 9:
+                        break
+                if j >= 9:
+                    break
+        logger.info(event_dict)
+        logger.info(questions_with_substrates)
 
-        if evidence_preds is True:
-            logger.info(" ------------------------------------------------------------ ")
-            logger.info(" EVIDENCE PREDICTIONS ")
-            if sampling_method == "top":
-                evidences = sorted(evidence_list, key=lambda x: x[1][0], reverse=True)  # Sort by descending confidence
-            else:  # Sampling method is random
-                evidences = random.sample(evidence_list, len(evidence_list))
-            top_pairs = evidences[:number]
-            for i, pair in enumerate(top_pairs):
-                logger.info("  **** Example {} ****".format(i))
-                logger.info("Substrate: {}".format(pair[0]))
-                logger.info("Kinase: {} (Synonyms: {}, Confidence: {}, PubMed ID: {})".format(pair[1], pair[2], pair[3], pair[4]))
-                logger.info("")
-                logger.info("Text Evidence: {}".format(pair[5]))
-                logger.info("")
+        return questions_with_substrates
 
-        return sorted_qa_pairs
-
-    def get_list_of_evidence(self, qa_pairs, events_by_entities, substrate_tuple=None):
-        qa_pairs_with_evidence = []
-        for substrate in events_by_entities:
-            if substrate_tuple is None or substrate_tuple == substrate:
-                for kinase, docs in events_by_entities[substrate].items():
-                    if (substrate, kinase) in qa_pairs and kinase[1] != "##":
-                        for pubmed_id, answers in docs.items():
-                            for confidence, text in answers[1]:
-                                qa_pairs_with_evidence.append((substrate, kinase, answers[0], confidence, pubmed_id, text))
-        return qa_pairs_with_evidence
-
-    def get_pairs_with_evidence(self, qa_pairs, events_by_entities, substrate_tuple=None):
+    def get_pairs_with_evidence(self, qa_pairs, events_by_entities, substrate_tuples=None):
         qa_pairs_with_evidence = {}
         for substrate in events_by_entities:
-            if substrate_tuple is None or substrate_tuple == substrate:
+            if substrate_tuples is None or substrate in substrate_tuples:
                 for kinase, docs in events_by_entities[substrate].items():
+                    qa_pairs_with_evidence.setdefault(substrate, {})
                     if (substrate, kinase) in qa_pairs and kinase[1] != "##":
-                        qa_pairs_with_evidence.setdefault((substrate, kinase), [])
+                        qa_pairs_with_evidence[substrate].setdefault(kinase, [])
                         for pubmed_id, answers in docs.items():
+                            # print(events_by_entities)
+                            # print(answers)
                             for confidence, text in answers[1]:
                                 # logger.info(answers)
                                 # logger.info(qa_pairs_with_evidence[(substrate, kinase)])
                                 # logger.info(answers[1])
                                 # logger.info(confidence)
-                                qa_pairs_with_evidence[(substrate, kinase)].append((answers[0], confidence, pubmed_id, text))
+                                qa_pairs_with_evidence[substrate][kinase].append((answers[0], confidence, pubmed_id, text))
         qa_pairs_with_evidence = list(qa_pairs_with_evidence.items())
         return qa_pairs_with_evidence
 
@@ -230,8 +221,17 @@ class ExampleVisualizer():
 
 
 if __name__ == "__main__":
-    visualizer = ExampleVisualizer(cached_file=NN_CACHE + "/processed_output_question_0_1.npz")
-    visualizer.visualize_entities()
+    from baseline.evex_baseline import KnowledgeBaseEvaluator
+
+    # visualizer = ExampleVisualizer(cached_file=NN_CACHE + "/processed_output_question_0_0.npz")
+    # visualizer.visualize_predictions()
+
+    kb_evaluator = KnowledgeBaseEvaluator()
+    visualizer = ExampleVisualizer(groundtruth_event_dict=kb_evaluator.indra_dict_verbose, prediction_event_dict=kb_evaluator.evex_dict_verbose)
+    visualizer.visualize_predictions()
+    print(list(kb_evaluator.evex_dict_verbose.items())[0])
+
+    # visualizer.visualize_entities()
     # groundtruth_subjects, predictions_subjects = visualizer.get_entity_questions()
     # logger.info(groundtruth_subjects)
     # logger.info()
@@ -239,4 +239,4 @@ if __name__ == "__main__":
     # visualizer.visualize_entities(('PHOSPHORYLATION_CAUSE', 'RBBP8_SUBSTRATE_EGID_5932'))
     # visualizer.visualize_entities(('PHOSPHORYLATION_CAUSE', 'GSK3B_SUBSTRATE_EGID_2932'))
     # visualizer.visualize_entities(('PHOSPHORYLATION_CAUSE', 'MAP2K1_SUBSTRATE_EGID_5604'))
-    visualizer.visualize_entity(('PHOSPHORYLATION_COMPLEXCAUSE', 'MAPK8_SUBSTRATE_EGID_5599'))
+    # visualizer.visualize_entity(('PHOSPHORYLATION_COMPLEXCAUSE', 'MAPK8_SUBSTRATE_EGID_5599'))

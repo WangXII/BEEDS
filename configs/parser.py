@@ -40,10 +40,10 @@ def parse_arguments():
                         help="The output directory where the model predictions will be written.")
     parser.add_argument("--visualize_preds", default=False, type=lambda x: (str(x).lower() == 'true'),
                         help="Whether to visualize the predictions or to calculate the evaluation or evaluate the metrics.")
-    parser.add_argument("--index_name", default="pubmed_sentences", type=str,
-                        help="Name of the primary ElasticSearch index.")
-    parser.add_argument("--index_name_two", default="pubmed_sentences", type=str,
-                        help="Name of the secondary ElasticSearch index. If the string equals 'None', ignore retrieving from a second index.")
+    parser.add_argument("--index", default="pubmed2", type=str,
+                        help="Name of the ElasticSearch index.")
+    parser.add_argument("--retrieval_granularity", default="sentences", type=str,
+                        help="Either retrieve on 'sentences' or 'paragraphs'.")
 
     parser.add_argument("--max_seq_length", default=384, type=int,
                         help="The maximum total input sequence length after tokenization. Sequences longer "
@@ -82,10 +82,22 @@ def parse_arguments():
                         help="Filter documents of an earlier publication date (before 2013) than the EVEX baseline.")
     parser.add_argument("--use_simple_normalizer", default=False, type=lambda x: (str(x).lower() == 'true'),
                         help="Use simple dictionary lookup as additional normalization tool.")
+    parser.add_argument("--batch_size", default=100, type=int,
+                        help="Batch size/Bag size for multi-instance learning.")
     parser.add_argument("--retrieval_size", default=100, type=int,
                         help="Retrieval size.")
     parser.add_argument("--retrieval_with_full_question", default=False, type=lambda x: (str(x).lower() == 'true'),
                         help="Retrieve wuith full question or only question keywords.")
+    parser.add_argument("--use_directly_supervised_data", default=False, type=lambda x: (str(x).lower() == 'true'),
+                        help="Train, evaluate and test with additional directly supervised data from BioNLP.")
+    parser.add_argument("--use_distantly_supervised_data", default=True, type=lambda x: (str(x).lower() == 'true'),
+                        help="Train, evaluate and test with distantly supervised data from KBs.")
+    parser.add_argument("--direct_weight", type=int, default=1,
+                        help="Weight for losses of directly supervised data. Weight for distantly supervised data is set to 1.")
+    parser.add_argument("--direct_data", default="BioNLP",
+                        type=str, help="The direct data. Must contain the name of the direct data set.")
+    parser.add_argument("--negative_examples", default=False, type=lambda x: (str(x).lower() == 'true'),
+                        help="Whether to include negative examples in the directly supervised data or not.")
 
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")

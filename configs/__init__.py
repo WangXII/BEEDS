@@ -3,6 +3,9 @@
 from transformers import AutoTokenizer
 from sqlitedict import SqliteDict
 
+# tqdm (disable when logging files to wandb)
+TQDM_DISABLE = True
+
 # BERT and RoBERTa configs
 ROBERTA_PATH = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/roberta-base-squad2"
 SCIBERT_PATH = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/scibert_scivocab_uncased"
@@ -47,11 +50,15 @@ class ModelHelper:
 # Raw text files or directories for text files
 
 # Biomedical knowledge bases
+HUMANCYC_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.humancyc.BIOPAX.owl"
+INOH_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.inoh.BIOPAX.owl"
+KEGG_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.kegg.BIOPAX.owl"
 PID_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.pid.BIOPAX.owl"
 PID_SIF = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.pid.hgnc.txt"
 PANTHER_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.panther.BIOPAX.owl"
 NETPATH_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.netpath.BIOPAX.owl"
 REACTOME_OWL = "/glusterfs/dfs-gfs-dist/wangxida/PathwayCommons12.reactome.BIOPAX.owl"
+OWL_LIST = [HUMANCYC_OWL, INOH_OWL, KEGG_OWL, PID_OWL, PANTHER_OWL, NETPATH_OWL, REACTOME_OWL]
 
 # Pubmed and Pubmed Central
 PUBMED_META_RAW_FILES_DIC = "/glusterfs/dfs-gfs-dist/wangxida/pubmed_meta/ftp.ncbi.nlm.nih.gov/pubmed/baseline"
@@ -73,9 +80,26 @@ UNIPROT_TO_PFAM_FILE = "/glusterfs/dfs-gfs-dist/wangxida/Pfam-A.regions.tsv"
 RELATIONS_FILE = "/glusterfs/dfs-gfs-dist/wangxida/evex/network-format/Metazoa/EVEX_relations_9606.tab"
 STANDOFF_DIR = "/glusterfs/dfs-gfs-dist/wangxida/evex/standoff-annotation/version-0.1/"
 
+# BIONLP filesevex/standoff-
+BIONLP_DIR = "/glusterfs/dfs-gfs-dist/wangxida/bionlp_datasets/"
+
 # ===============================================================================================================
 
+# Shortened list of event substrates because number of pair of proteins becomes too big too fast
+EVENT_SUBSTRATES_COMPLEX_MULTI = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/event_substrates_complex_multi.pickle"
+
 # Biomedical data caches
+
+HUMANCYC_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/humancyc_model.pickle"
+INOH_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/inoh_model.pickle"
+KEGG_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/kegg_model.pickle"
+PID_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_with_complexes.pickle"
+PID_MODEL_FAMILIES = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_with_families.pickle"
+PID_MODEL_EXPANDED = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_expanded.pickle"
+PANTHER_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/panther_model.pickle"
+NETPATH_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/netpath_model.pickle"
+REACTOME_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/reactome_model.pickle"
+OWL_STATEMENTS = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/owl_statements.pickle"
 
 PUBMED_META_DB = "/glusterfs/dfs-gfs-dist/wangxida/pubmed_meta.sqlite"
 PUBMED_DOC_ANNOTATIONS_DB = "/glusterfs/dfs-gfs-dist/wangxida/pubtator_normalizer.sqlite"
@@ -84,17 +108,13 @@ SIMPLE_NORMALIZER_DB = "/glusterfs/dfs-gfs-dist/wangxida/simple_normalizer.sqlit
 PFAM_DB = "/glusterfs/dfs-gfs-dist/wangxida/pfam.sqlite"
 GENE_INFO_DB = "sqlite:////glusterfs/dfs-gfs-dist/wangxida/gene_info.db"
 GENE_ID_TO_NAMES_DB = "/glusterfs/dfs-gfs-dist/wangxida/gene_id_to_names.pickle"
-PID_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_with_complexes.pickle"
-PID_MODEL_FAMILIES = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_with_families.pickle"
-PID_MODEL_EXPANDED = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/pid_model_expanded.pickle"
-PANTHER_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/panther_model.pickle"
-NETPATH_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/netpath_model.pickle"
-REACTOME_MODEL = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/reactome_model.pickle"
 BASELINE_DIR = "/glusterfs/dfs-gfs-dist/wangxida/masterarbeit/cache/evex_relations.pickle"
 STANDOFF_CACHE = "/glusterfs/dfs-gfs-dist/wangxida/evex/evex_standoff.sqlite"
 STANDOFF_CACHE_SIMPLE = "/glusterfs/dfs-gfs-dist/wangxida/evex/evex_standoff_simple.sqlite"
 STANDOFF_CACHE_PMIDS = "/glusterfs/dfs-gfs-dist/wangxida/evex/evex_standoff_pmids.sqlite"
 STANDOFF_CACHE_RANDOM = "/glusterfs/dfs-gfs-dist/wangxida/evex/evex_standoff_random.sqlite"
+BIONLP_CACHE = "/glusterfs/dfs-gfs-dist/wangxida/bionlp_datasets/bionlp_standoff.sqlite"
+GENE_NAMES_CACHE = "/glusterfs/dfs-gfs-dist/wangxida/bionlp_datasets/gene_names.sqlite"
 
 DICT_NORMALIZER = SqliteDict(SIMPLE_NORMALIZER_DB, tablename='simple_normalizer', flag='r', autocommit=False)
 

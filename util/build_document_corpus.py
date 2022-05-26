@@ -2,58 +2,71 @@
     and build Lucene Index in the ElasticSearch Folder
 """
 
+import sys
 import os
+
+if os.name == 'nt':
+    root_path = "/".join(os.path.realpath(__file__).split("\\")[:-2])
+else:
+    root_path = "/".join(os.path.realpath(__file__).split("/")[:-2])
+if root_path not in sys.path:
+    sys.path.append(root_path)
+
+import logging
+
+logging.basicConfig(level=logging.WARNING, datefmt="%Y/%m/%d %H:%M:%S",
+                    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 import re
 import parse
 import lxml.etree as ET
+import multiprocessing_logging
 
 from nltk import tokenize
 from pathlib import Path
 from tqdm import tqdm
-from haystack.document_store.elasticsearch import ElasticsearchDocumentStore
+from haystack.document_stores.elasticsearch import ElasticsearchDocumentStore
 from sqlitedict import SqliteDict
-from multiprocessing import Pool
+from multiprocessing import Manager, Pool, Process
 from itertools import repeat
 # from elasticsearch import Elasticsearch
 
-from configs import PUBMED_META_DB, PMC_TO_PMID_MAPPER, PMC_DOCS_DIRECTORY, PUBMED_META_RAW_FILES_DIC, PUBMED_META_XSLT, PUBMED_FILES_PUBTATOR
-
-import logging
-
-# logging.basicConfig(filename='/glusterfs/dfs-gfs-dist/wangxida/myapp.log', level=logging.DEBUG,
-#                     format='%(asctime)s %(levelname)s %(name)s %(message)s')
-logger = logging.getLogger(__name__)
-
+from configs import PUBMED_META_DB, PMC_TO_PMID_MAPPER, PMC_DOCS_DIRECTORY, PUBMED_META_RAW_FILES_DIC, PUBMED_META_XSLT, PUBMED_FILES_PUBTATOR, TQDM_DISABLE
 
 class IndexWriter:
-    def __init__(self, index_name="pubmed_detailed", overwrite_index=False, index_batch_size=100000):
-        self.db_path = PUBMED_META_DB
+    def __init__(self, index_name="pubmed_detailed", overwrite_index=False, index_batch_size=10_000):
+        self.pubmed_meta_db = SqliteDict(PUBMED_META_DB, tablename='pubmed_meta', flag='r', autocommit=False)
         self.index_batch_size = index_batch_size
-        self.pubmed_meta_db = SqliteDict(self.db_path, tablename='pubmed_meta', flag='r', autocommit=False)
         self.document_store = ElasticsearchDocumentStore(host="localhost", username="", password="", index=index_name)
         if overwrite_index:
-            self.document_store.delete_all_documents(index=index_name)
+            self.document_store.delete_documents(index=index_name)
         self.documents = []
         self.documents_processed = 0
 
     def add_docs_to_index(self, text, pubmed_id, par_id, sentence_id=None):
+        # Uncomment when indexing PubMed Central
+        # self.pubmed_meta_db = SqliteDict(PUBMED_META_DB, tablename='pubmed_meta', flag='r', autocommit=False)
         if sentence_id is None:
             if pubmed_id not in self.pubmed_meta_db:
-                self.documents.append({"text": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "month": "Jan", "year": "9999"}})
+                self.documents.append({"content": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": -1, "year": 9999}})
             else:
-                self.documents.append({"text": text, "meta": {"name": pubmed_id, "paragraph_id": par_id,
-                                                              "month": self.pubmed_meta_db[pubmed_id][1], "year": self.pubmed_meta_db[pubmed_id][0]}})
+                self.documents.append({"content": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": -1,
+                                                                 "year": int(self.pubmed_meta_db[pubmed_id][0])}})
         else:
             if pubmed_id not in self.pubmed_meta_db:
-                self.documents.append({"text": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": sentence_id, "year": 9999}})
+                self.documents.append({"content": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": sentence_id, "year": 9999}})
             else:
-                self.documents.append({"text": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": sentence_id,
-                                                              "year": int(self.pubmed_meta_db[pubmed_id][0])}})
+                self.documents.append({"content": text, "meta": {"name": pubmed_id, "paragraph_id": par_id, "sentence_id": sentence_id,
+                                                                 "year": int(self.pubmed_meta_db[pubmed_id][0])}})
         self.documents_processed += 1
         if self.documents_processed == self.index_batch_size:
             self.flush_docs_cache()
             self.documents = []
             self.documents_processed = 0
+
+    def initialize_sql_dict(self):
+        self.pubmed_meta_db = SqliteDict(self.db_path, tablename='pubmed_meta', flag='r', autocommit=False)
 
     def flush_docs_cache(self):
         try:
@@ -69,7 +82,7 @@ def get_pmid_from_pmcid_mapper():
     format_strings = ["{journal} {year:.4} {month:3} {day:.2}", "{journal} {year:.4} {month:3}", "{journal} {year:.4}", "{journal}"]
     with open(file_path, "r") as f:
         txt_lines = f.readlines()
-        for line in tqdm(txt_lines):
+        for line in tqdm(txt_lines, disable=TQDM_DISABLE):
             content = line.split('\t')
             if len(content) != 5:
                 continue
@@ -113,89 +126,113 @@ def get_pmid_from_pmcid_mapper():
     return string_mapper, pmcid_mapper
 
 
-# For multiprocessing https://chriskiehl.com/article/parallelism-in-one-line
-# https://stackoverflow.com/questions/41920124/multiprocessing-use-tqdm-to-display-a-progress-bar
-
-def add_pubmed_central(stringid_mapper, pmcid_mapper):
+def add_pubmed_central_parallel(stringid_mapper, pmcid_mapper, index_name="pubmed_detailed", overwrite_index=False,
+                                num_workers=1, queue_size=None):
     path = PMC_DOCS_DIRECTORY
-    number_files = 0
-    index_writer = IndexWriter(overwrite_index=True)
-    pbar = tqdm(os.listdir(path), desc="Full texts processed: {}. Docs written: {}.".format(number_files, index_writer.documents_processed))
-    for directory in pbar:
-        pbar.set_description(desc="Full texts processed: {}. Docs written: {}.".format(number_files, index_writer.documents_processed))
-        number_files = add_pubmed_central_file(path, directory, index_writer, number_files, stringid_mapper, pmcid_mapper)
-    index_writer.flush_docs_cache()
+    num_workers = num_workers
+    manager = Manager()
+    if queue_size is None:
+        max_queue_size = 100 * num_workers
+    else:
+        max_queue_size = queue_size
+    work_queue = manager.Queue(maxsize=max_queue_size)
+
+    # Start for workers
+    pool = []
+    for _ in range(num_workers):
+        p = FullTextsConsumer(work_queue, index_name, overwrite_index, path, stringid_mapper, pmcid_mapper)
+        p.start()
+        pool.append(p)
+
+    for i, directory in enumerate(tqdm(os.listdir(path))):
+        if i <= 3000:
+            continue
+        dir_full_name = os.path.join(path, directory)
+        if os.path.isdir(dir_full_name):
+            for pubmed_file in tqdm(os.listdir(dir_full_name)):
+                pubmed_file_name = os.path.join(path, directory, pubmed_file)
+                if pubmed_file_name.endswith(".txt"):
+                    pmc_name = pubmed_file[3:-4]
+                    file_name = pubmed_file[:-4]
+                    if pmc_name in pmcid_mapper:
+                        pmid = pmcid_mapper[pmc_name]
+                    elif file_name in stringid_mapper:
+                        pmid = stringid_mapper[file_name]
+                    else:
+                        continue
+                    if pmid == "":
+                        continue
+                    work_queue.put((pubmed_file_name, pmid))
+
+    for _ in pool:
+        work_queue.put(None)
+        logger.info("Send poison pill...")
+
+    for i, p in enumerate(pool):
+        p.join()
+        logger.info("Process {} has joined...".format(i))
+
+    logger.info("Finished processing all Pubmed Central documents!")
 
 
-def add_pubmed_central_parallel(stringid_mapper, pmcid_mapper):
-    path = PMC_DOCS_DIRECTORY
-    number_files = 0
-    index_writer = None
-    directories = []
-    for directory in os.listdir(path):
-        directories.append(directory)
-    inputs = list(zip(repeat(path), directories, repeat(index_writer), repeat(number_files), repeat(stringid_mapper), repeat(pmcid_mapper)))
-    with Pool() as pool:
-        _ = pool.starmap(add_pubmed_central_file, tqdm(inputs, total=len(inputs)))
+class FullTextsConsumer(Process):
+    def __init__(self, task_queue, index_name="pubmed", overwrite_index=False, path="", stringid_mapper=None, pmcid_mapper=None):
+        Process.__init__(self)
+        self.task_queue = task_queue
+        self.index_name = index_name
+        self.overwrite_index = overwrite_index
+        self.path = path
+        self.stringid_mapper = stringid_mapper
+        self.pmcid_mapper = pmcid_mapper
 
-
-def add_pubmed_central_file(path, directory, index_writer, number_files, stringid_mapper, pmcid_mapper):
-    if index_writer is None:
-        index_writer = IndexWriter(index_name="pubmed_sentences", overwrite_index=False, index_batch_size=1000000)
-    par_docs_bool = False
-    text_body_bool = False
-    dir_full_name = os.path.join(path, directory)
-    if os.path.isdir(dir_full_name):
-        for pubmed_file in os.listdir(dir_full_name):
-            number_files += 1
-            pubmed_file_name = os.path.join(path, directory, pubmed_file)
-            if pubmed_file_name.endswith(".txt"):
-                pmc_name = pubmed_file[3:-4]
-                file_name = pubmed_file[:-4]
-                if pmc_name in pmcid_mapper:
-                    pmid = pmcid_mapper[pmc_name]
-                elif file_name in stringid_mapper:
-                    pmid = stringid_mapper[file_name]
-                else:
-                    continue
-                if pmid == "":
-                    continue
-                with open(pubmed_file_name, "r", encoding="utf-8", errors="replace") as f:
-                    text_body_bool = False
-                    current_paragraph = ""
-                    paragraph_count = 1
-                    txt_lines = f.readlines()
-                    for line in txt_lines:
-                        if line == "==== Body\n":
-                            text_body_bool = True
-                        elif line == "==== Refs\n":
-                            text_body_bool = False
-                        if text_body_bool:
-                            if line.strip() == "":
-                                if par_docs_bool:
-                                    index_writer.add_docs_to_index(current_paragraph, pmid, str(paragraph_count))
-                                else:
-                                    sentences = tokenize.sent_tokenize(current_paragraph)
-                                    # print(sentences)
-                                    # print(len(sentences[0]))
-                                    # raise ValueError
-                                    for sentence_id, sentence in enumerate(sentences):
-                                        if len(sentence) > 10 and len(sentence) < 1000:  # Sentences longer than 1000 characters are not more precise than paragraphs
-                                            index_writer.add_docs_to_index(sentence, int(pmid), paragraph_count, sentence_id=sentence_id)
-                                current_paragraph = ""
-                                paragraph_count += 1
-                            else:
-                                current_paragraph += line
-                    if current_paragraph.strip() != "":
-                        if par_docs_bool:
-                            index_writer.add_docs_to_index(current_paragraph, pmid, str(paragraph_count))
-                        else:
+    def run(self):
+        logger.info("Starting process...")
+        self.doc_writer = IndexWriter(index_name=self.index_name, overwrite_index=self.overwrite_index)
+        while True:
+            pubmed_files = self.task_queue.get()
+            # Poision pill
+            if pubmed_files is None:
+                self.doc_writer.flush_docs_cache()
+                logger.info("Shutting down process...")
+                return
+            pubmed_file_name = pubmed_files[0]
+            pmid = pubmed_files[1]
+            text_body_bool = False
+            current_paragraph = ""
+            paragraph_count = 1
+            with open(pubmed_file_name, "r", encoding="utf-8", errors="replace") as f:
+                txt_lines = f.readlines()
+                for line in txt_lines:
+                    if line == "==== Body\n":
+                        text_body_bool = True
+                    elif line == "==== Refs\n":
+                        text_body_bool = False
+                    if text_body_bool:
+                        if line.strip() == "" and current_paragraph != "":
+                            self.doc_writer.add_docs_to_index(current_paragraph.replace("\n", "").replace("\t", ""), int(pmid), paragraph_count)
                             sentences = tokenize.sent_tokenize(current_paragraph)
+                            # print(sentences)
+                            # print(len(sentences[0]))
+                            # raise ValueError
                             for sentence_id, sentence in enumerate(sentences):
-                                if len(sentence) > 10 and len(sentence) < 1000:  # Sentences longer than 1000 characters are not more precise than paragraphs
-                                    index_writer.add_docs_to_index(sentence, int(pmid), paragraph_count, sentence_id=sentence_id)
-    index_writer.flush_docs_cache()
-    return number_files
+                                # Sentences longer than 1000 characters are not more precise than paragraphs
+                                if len(sentence) > 10 and len(sentence) < 1000:
+                                    self.doc_writer.add_docs_to_index(sentence.replace("\n", "").replace("\t", ""), int(pmid),
+                                                                      paragraph_count, sentence_id=sentence_id)
+                            current_paragraph = ""
+                            paragraph_count += 1
+                        else:
+                            current_paragraph += line
+                if current_paragraph.strip() != "":
+                    self.doc_writer.add_docs_to_index(current_paragraph.replace("\n", "").replace("\t", ""), int(pmid), paragraph_count)
+                    sentences = tokenize.sent_tokenize(current_paragraph)
+                    for sentence_id, sentence in enumerate(sentences):
+                        # Sentences longer than 1000 characters are not more precise than paragraphs
+                        if len(sentence) > 10 and len(sentence) < 1000:
+                            self.doc_writer.add_docs_to_index(sentence.replace("\n", "").replace("\t", ""), int(pmid),
+                                                              paragraph_count, sentence_id=sentence_id)
+            # self.doc_writer.flush_docs_cache()
+            # logger.info("Finished indexing directory {}!".format(directory))
 
 
 def extract_abstract(line):
@@ -232,32 +269,74 @@ def build_pubmed_date_dict():
     pubmed_meta_db.close()
 
 
-def build_pubmed_index(index_name="pubmed_detailed", index_batch_size=100000, par_docs_bool=True):
+class AbstractsConsumer(Process):
+    def __init__(self, task_queue, index_name="pubmed", overwrite_index=False, index_batch_size=10_000):
+        Process.__init__(self)
+        self.task_queue = task_queue
+        self.index_name = index_name
+        self.overwrite_index = overwrite_index
+        self.index_batch_size = index_batch_size
+
+    def run(self):
+        logger.info("Starting process...")
+        self.doc_writer = IndexWriter(index_name=self.index_name, overwrite_index=self.overwrite_index, index_batch_size=self.index_batch_size)
+        while True:
+            line = self.task_queue.get()
+            # Poision pill
+            if line is None:
+                self.doc_writer.flush_docs_cache()
+                logger.info("Shutting down process...")
+                return
+            abstract = extract_abstract(line)
+            if len(abstract) == 2 and abstract[1] != "\n":
+                pubmed_id = abstract[0]
+                self.doc_writer.add_docs_to_index(abstract[1].replace("\n", "").replace("\t", ""), int(pubmed_id), 0)
+                sentences = tokenize.sent_tokenize(abstract[1])
+                # print(sentences)
+                # print(len(sentences[0]))
+                # exit()
+                for sentence_id, sentence in enumerate(sentences):
+                    if len(sentence) < 1000:  # Sentences longer than 1000 characters are not more precise than paragraphs
+                        self.doc_writer.add_docs_to_index(sentence.replace("\n", "").replace("\t", ""), int(pubmed_id), 0, sentence_id=sentence_id)
+
+
+def build_pubmed_index(index_name="pubmed_detailed", overwrite_index=False, index_batch_size=10_000, num_workers=1, queue_size=None):
     document_path = PUBMED_FILES_PUBTATOR
     # /home/tmp/wangxida/elasticsearch-7.9.2
+    # https://stackoverflow.com/questions/11196367/processing-single-file-from-multiple-processes
+    # https://stackoverflow.com/questions/11196438/what-does-multiprocessing-process-init-self-do
+    num_workers = num_workers
+    manager = Manager()
+    if queue_size is None:
+        max_queue_size = 100 * num_workers
+    else:
+        max_queue_size = queue_size
+    work_queue = manager.Queue(maxsize=max_queue_size)
 
-    doc_writer = IndexWriter(index_name=index_name, overwrite_index=False, index_batch_size=index_batch_size)
+    # Start for workers
+    pool = []
+    for _ in range(num_workers):
+        p = AbstractsConsumer(work_queue, index_name, overwrite_index, index_batch_size)
+        p.start()
+        pool.append(p)
+
     with tqdm(total=Path(document_path).stat().st_size) as pbar:
         with open(document_path) as infile:
             line = infile.readline()
             while line:
                 pbar.update(infile.tell() - pbar.n)
-                abstract = extract_abstract(line)
-                if len(abstract) == 2 and abstract[1] != "\n":
-                    pubmed_id = abstract[0]
-                    if par_docs_bool:
-                        doc_writer.add_docs_to_index(abstract[1], pubmed_id, "0")
-                    else:
-                        sentences = tokenize.sent_tokenize(abstract[1])
-                        # print(sentences)
-                        # print(len(sentences[0]))
-                        # exit()
-                        for sentence_id, sentence in enumerate(sentences):
-                            if len(sentence) < 1000:  # Sentences longer than 1000 characters are not more precise than paragraphs
-                                doc_writer.add_docs_to_index(sentence, int(pubmed_id), 0, sentence_id=sentence_id)
+                work_queue.put(line)
                 line = infile.readline()
 
-            doc_writer.flush_docs_cache()
+    for _ in pool:
+        work_queue.put(None)
+        logger.info("Send poison pill...")
+
+    for i, p in enumerate(pool):
+        p.join()
+        logger.info("Process {} has joined...".format(i))
+
+    logger.info("Processed all Pubmed Abstracts!")
 
 
 def count_sentences_pubmed():
@@ -287,17 +366,46 @@ if __name__ == "__main__":
     #     print(item)
     # build_pubmed_date_dict()
 
-    # Build Pubmed Index (on paragraph basis)
-    # build_pubmed_index()
+    logger.setLevel(logging.INFO)
+    multiprocessing_logging.install_mp_handler()
+    logger.info("Start indexing")
 
-    # Build Pubmed Index (on sentence basis)
-    # build_pubmed_index(index_name="pubmed_sentences", index_batch_size=1000000, par_docs_bool=False)
-    print(count_sentences_pubmed())
+    # Build Pubmed Index (on paragraph and sentence basis)
+    # build_pubmed_index("pubmed2", overwrite_index=False, num_workers=16)
 
-    # Build PubMed Central Index (on paragraph basis)
-    # stringid_mapper, pmcid_mapper = get_pmid_from_pmcid_mapper()
-    # add_pubmed_central(stringid_mapper, pmcid_mapper)
+    # Build PubMed Central Index (on paragraph and sentence basis)
+    stringid_mapper, pmcid_mapper = get_pmid_from_pmcid_mapper()
+    add_pubmed_central_parallel(stringid_mapper, pmcid_mapper, index_name="pubmed2", num_workers=16)
 
-    # Build PubMed Central Index (on sentence basis)
-    # stringid_mapper, pmcid_mapper = get_pmid_from_pmcid_mapper()
-    # add_pubmed_central_parallel(stringid_mapper, pmcid_mapper)
+    # Debug wrong mapping from paragraph ids
+    # with open("/glusterfs/dfs-gfs-dist/wangxida/pubmed_central/J_Cell_Biol/PMC2137816.txt", "r", encoding="utf-8", errors="replace") as f:
+    #     text_body_bool = False
+    #     current_paragraph = ""
+    #     paragraph_count = 1
+    #     txt_lines = f.readlines()
+    #     for i, line in enumerate(txt_lines):
+    #         if line == "==== Body\n":
+    #             text_body_bool = True
+    #         elif line == "==== Refs\n":
+    #             text_body_bool = False
+    #         if text_body_bool:
+    #             if line.strip() == "":
+    #                 if paragraph_count >= 0 and paragraph_count < 4000:
+    #                     print("  Add paragraph")
+    #                     print(paragraph_count)
+    #                     print(current_paragraph)
+    #                 sentences = tokenize.sent_tokenize(current_paragraph)
+    #                 # print(sentences)
+    #                 # print(len(sentences[0]))
+    #                 # raise ValueError
+    #                 for sentence_id, sentence in enumerate(sentences):
+    #                     if len(sentence) > 10 and len(sentence) < 1000 and paragraph_count >= 0 and paragraph_count < 4000:
+    #                         print("  Add sentence")
+    #                         print(paragraph_count, sentence_id)
+    #                         print(sentence)
+    #                 current_paragraph = ""
+    #                 paragraph_count += 1
+    #             else:
+    #                 current_paragraph += line
+    #         if paragraph_count == 5:
+    #             break

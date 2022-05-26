@@ -18,10 +18,10 @@ from tqdm import tqdm
 from sklearn.metrics import PrecisionRecallDisplay
 
 from metrics.sklearn_revised import average_precision_score, precision_recall_curve
-from data_processing.datatypes import Question, get_db_id, QUESTION_TYPES, QUESTION_TYPES_EVEX, get_subject_list
+from data_processing.datatypes import Question, get_db_id, QUESTION_TYPES, QUESTION_TYPES_EVEX, get_subject_list, parse_subject_strings
 from data_processing.biopax_to_retrieval import IndraDataLoader
-from configs import PID_MODEL_FAMILIES, STANDOFF_CACHE, STANDOFF_CACHE_SIMPLE
-from baseline.evex_standoff import BaselineEventDict, EVEX_QUESTION_MAPPER
+from configs import OWL_STATEMENTS, STANDOFF_CACHE, STANDOFF_CACHE_PMIDS, STANDOFF_CACHE_SIMPLE, TQDM_DISABLE
+from baseline.evex_standoff import BaselineEventDict, EVEX_QUESTION_MAPPER, PTMS
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -33,7 +33,7 @@ logger.setLevel(logging.INFO)
 
 class KnowledgeBaseEvaluator:
 
-    def __init__(self, groundtruth_dict=None, predictions_dict=None, mode="eval", standoff=False):
+    def __init__(self, groundtruth_dict=None, predictions_dict=None, mode="eval"):
         self.mode = mode
         self.indra_dict, self.indra_dict_verbose = self._get_indra_relations(self.mode)
         self.model_groundtruth_dict = groundtruth_dict
@@ -41,10 +41,7 @@ class KnowledgeBaseEvaluator:
         self.model_indra_dict = None
         if groundtruth_dict is not None:
             self.model_indra_dict = self._get_event_intersection(self.indra_dict, self.model_groundtruth_dict)
-        if standoff:
-            self.evex_dict = self._get_all_evex_standoff_relations()
-        else:
-            self.evex_dict = self._get_all_evex_relations(use_cache=True)
+        self.evex_dict, self.evex_dict_verbose = self._get_all_evex_standoff_relations()
 
     @classmethod
     def _get_all_evex_standoff_relations(cls):
@@ -53,30 +50,34 @@ class KnowledgeBaseEvaluator:
             The higher the value, the more confident is the prediction.
         '''
 
-        evex_dict = BaselineEventDict(standoff_cache=STANDOFF_CACHE)
+        evex_dict = BaselineEventDict(standoff_cache=STANDOFF_CACHE_PMIDS)
         evex_dict.load_event_dict()
         relations = {}
+        relations_verbose = {}
 
         for key, values in evex_dict.evex_db.items():
             for value in values:
                 event_type = ""
-                _, protein_id = key.split("_", 1)
-                if len(value) == 10 or len(value) == 8:  # Protein Complex Interaction 10 (PTMS), 8 (OTHER)
-                    event_type = value[6]
+                text_file = value[-1]
+                # _, protein_id = key.split("_", 1)
+                if len(value) == 15 or len(value) == 12:  # Protein Complex Interaction 10 (PTMS), 8 (OTHER)
+                    event_type = value[9]
                     # regulation_type = value[7]
-                elif len(value) == 7:  # Protein Site Description
-                    event_type = value[4]
-                elif len(value) == 6:  # Complex
+                elif len(value) == 10 and value[5] in PTMS:  # Protein Site Description
                     event_type = value[5]
+                elif len(value) == 8 or len(value) == 10:  # Complex
+                    event_type = "Binding"
 
-                if event_type in EVEX_QUESTION_MAPPER and len(value) in [8, 10] and value[0] != "":
+                if event_type in EVEX_QUESTION_MAPPER and len(value) in [12, 15] and value[0] != "":
                     theme_id = ("EGID", value[0])
-                    cause_ids = (("EGID", value[1]), ("EGID", value[2]))
+                    theme_infos = value[1]  # Name, Start Position, End Position
+                    cause_ids = (("EGID", value[2]), ("EGID", value[4]))
+                    cause_infos = (value[3], value[5])  # Name, Start Position, End Position
 
                     for i, cause_id in enumerate(cause_ids):
                         if cause_id[1] == "" or cause_id == theme_id:
                             continue
-                        confidence_score = float(value[3])
+                        confidence_score = float(value[6])
                         # negation = value[4]
                         # Our model does not look for negations so we also do not look for negations in the baseline
                         if True:  # negation != 1:
@@ -88,6 +89,15 @@ class KnowledgeBaseEvaluator:
                             if (cause_id in themes and confidence_score > themes[cause_id][0]) or (cause_id not in themes):
                                 themes[cause_id][0] = confidence_score
                             themes[cause_id][1] += 1
+
+                            # relations_verbose used for visualization
+                            subject_list = (question_type, theme_id)
+                            relations_verbose.setdefault(subject_list, {})
+                            relations_verbose[subject_list].setdefault(cause_id, {})
+                            relations_verbose[subject_list][cause_id].setdefault(text_file, [set(), []])
+                            relations_verbose[subject_list][cause_id][text_file][0].add(theme_infos[0])
+                            relations_verbose[subject_list][cause_id][text_file][1].append((confidence_score, [text_file, theme_infos, cause_infos[i]]))
+
                             # Add pairs for the general STATECHANGE_CAUSE question type
                             statechange = relations.setdefault("STATECHANGE_CAUSE", {})
                             themes = statechange.setdefault(theme_id, {})
@@ -96,11 +106,19 @@ class KnowledgeBaseEvaluator:
                                 themes[cause_id][0] = confidence_score
                             themes[cause_id][1] += 1
 
+                            # relations_verbose used for visualization
+                            subject_list = ("STATECHANGE_CAUSE", theme_id)
+                            relations_verbose.setdefault(subject_list, {})
+                            relations_verbose[subject_list].setdefault(cause_id, {})
+                            relations_verbose[subject_list][cause_id].setdefault(text_file, [set(), []])
+                            relations_verbose[subject_list][cause_id][text_file][0].add(theme_infos[0])
+                            relations_verbose[subject_list][cause_id][text_file][1].append((confidence_score, [text_file, theme_infos, cause_infos[i]]))
+
                             # Add _COMPLEXSITE events for PTMs
-                            if len(value) == 10 and EVEX_QUESTION_MAPPER[event_type] != "STATECHANGE":
+                            if len(value) == 15 and EVEX_QUESTION_MAPPER[event_type] != "STATECHANGE":
                                 question_type = EVEX_QUESTION_MAPPER[event_type] + "_COMPLEXSITE"
                                 complex_site = relations.setdefault(question_type, {})
-                                res_pos = ("SITE", value[8] + value[9])
+                                res_pos = ("SITE", value[11] + value[12])
                                 if res_pos[1] != "":
                                     themes = complex_site.setdefault((theme_id, cause_id), {})
                                     themes.setdefault(res_pos, [0, 0])
@@ -108,34 +126,45 @@ class KnowledgeBaseEvaluator:
                                         themes[res_pos][0] = confidence_score
                                     themes[res_pos][1] += 1
 
-                            # Add _COMPLEXCAUSE events
-                            if i == 0:
-                                other_cause_id = cause_ids[1]
-                            else:
-                                other_cause_id = cause_ids[0]
-                            if not (other_cause_id[1] == "" or other_cause_id == theme_id):
-                                question_type = EVEX_QUESTION_MAPPER[event_type] + "_COMPLEXCAUSE"
-                                complex_modification = relations.setdefault(question_type, {})
-                                themes = complex_modification.setdefault((theme_id, cause_id), {})
-                                themes.setdefault(other_cause_id, [0, 0])
-                                if (other_cause_id in themes and confidence_score > themes[other_cause_id][0]) or (other_cause_id not in themes):
-                                    themes[other_cause_id][0] = confidence_score
-                                themes[other_cause_id][1] += 1
-                                # Add pairs for the general STATECHANGE_COMPLEXCAUSE question type
-                                complex_statechange = relations.setdefault("STATECHANGE_COMPLEXCAUSE", {})
-                                themes = complex_statechange.setdefault((theme_id, cause_id), {})
-                                themes.setdefault(other_cause_id, [0, 0])
-                                if (other_cause_id in themes and confidence_score > themes[other_cause_id][0]) or (other_cause_id not in themes):
-                                    themes[other_cause_id][0] = confidence_score
-                                themes[other_cause_id][1] += 1
+                                    # relations_verbose used for visualization
+                                    subject_list = (question_type, (theme_id, cause_id))
+                                    site_infos = value[13]
+                                    relations_verbose.setdefault(subject_list, {})
+                                    relations_verbose[subject_list].setdefault(res_pos, {})
+                                    relations_verbose[subject_list][res_pos].setdefault(text_file, [set(), []])
+                                    relations_verbose[subject_list][res_pos][text_file][0].update([theme_infos[0], cause_infos[0]])
+                                    relations_verbose[subject_list][res_pos][text_file][1].append(
+                                        (confidence_score, [text_file, (theme_infos, cause_infos[i]), site_infos]))
+
+                            # Add _COMPLEXCAUSE events ==> Ignore for now
+                            # if i == 0:
+                            #     other_cause_id = cause_ids[1]
+                            # else:
+                            #     other_cause_id = cause_ids[0]
+                            # if not (other_cause_id[1] == "" or other_cause_id == theme_id):
+                            #     question_type = EVEX_QUESTION_MAPPER[event_type] + "_COMPLEXCAUSE"
+                            #     complex_modification = relations.setdefault(question_type, {})
+                            #     themes = complex_modification.setdefault((theme_id, cause_id), {})
+                            #     themes.setdefault(other_cause_id, [0, 0])
+                            #     if (other_cause_id in themes and confidence_score > themes[other_cause_id][0]) or (other_cause_id not in themes):
+                            #         themes[other_cause_id][0] = confidence_score
+                            #     themes[other_cause_id][1] += 1
+                            #     # Add pairs for the general STATECHANGE_COMPLEXCAUSE question type
+                            #     complex_statechange = relations.setdefault("STATECHANGE_COMPLEXCAUSE", {})
+                            #     themes = complex_statechange.setdefault((theme_id, cause_id), {})
+                            #     themes.setdefault(other_cause_id, [0, 0])
+                            #     if (other_cause_id in themes and confidence_score > themes[other_cause_id][0]) or (other_cause_id not in themes):
+                            #         themes[other_cause_id][0] = confidence_score
+                            #     themes[other_cause_id][1] += 1
 
                 # Add _SITE events for PTMs
-                if event_type in EVEX_QUESTION_MAPPER and len(value) == 7:
+                if event_type in PTMS and event_type in EVEX_QUESTION_MAPPER and len(value) == 10:
                     theme_id = ("EGID", value[0])
-                    confidence_score = float(value[1])
+                    theme_infos = value[1]  # Name, Start Position, End Position
+                    confidence_score = float(value[2])
                     question_type = EVEX_QUESTION_MAPPER[event_type] + "_SITE"
                     site = relations.setdefault(question_type, {})
-                    res_pos = ("SITE", value[5] + value[6])
+                    res_pos = ("SITE", value[6] + value[7])
                     if res_pos[1] != "":
                         themes = site.setdefault((theme_id), {})
                         themes.setdefault(res_pos, [0, 0])
@@ -143,7 +172,68 @@ class KnowledgeBaseEvaluator:
                             themes[res_pos][0] = confidence_score
                         themes[res_pos][1] += 1
 
-        return relations
+                        # relations_verbose used for visualization
+                        subject_list = (question_type, theme_id)
+                        site_infos = value[8]
+                        relations_verbose.setdefault(subject_list, {})
+                        relations_verbose[subject_list].setdefault(res_pos, {})
+                        relations_verbose[subject_list][res_pos].setdefault(text_file, [set(), []])
+                        relations_verbose[subject_list][res_pos][text_file][0].add(site_infos[0])
+                        relations_verbose[subject_list][res_pos][text_file][1].append((confidence_score, [text_file, theme_infos, site_infos]))
+
+                # Add COMPLEX_PAIR events
+                if event_type == "Binding" and len(value) == 8:
+                    theme_id = ("EGID", value[0])
+                    theme_infos = value[1]  # Name, Start Position, End Position
+                    complex_partner_id = ("EGID", value[2])
+                    confidence_score = float(value[4])
+                    question_type = EVEX_QUESTION_MAPPER[event_type] + "_PAIR"
+                    if question_type != "COMPLEX_PAIR":
+                        print(event_type)
+                        print(value)
+                        print(key)
+                        print(values)
+                        exit()
+                    complex_partner = relations.setdefault(question_type, {})
+                    themes = complex_partner.setdefault(theme_id, {})
+                    themes.setdefault(complex_partner_id, [0, 0])
+                    if (complex_partner_id in themes and confidence_score > themes[complex_partner_id][0]) or (complex_partner_id not in themes):
+                        themes[complex_partner_id][0] = confidence_score
+                    themes[complex_partner_id][1] += 1
+
+                    # relations_verbose used for visualization
+                    subject_list = (question_type, theme_id)
+                    complex_partner_infos = value[3]
+                    relations_verbose.setdefault(subject_list, {})
+                    relations_verbose[subject_list].setdefault(complex_partner_id, {})
+                    relations_verbose[subject_list][complex_partner_id].setdefault(text_file, [set(), []])
+                    relations_verbose[subject_list][complex_partner_id][text_file][0].add(theme_infos[0])
+                    relations_verbose[subject_list][complex_partner_id][text_file][1].append((confidence_score, [text_file, theme_infos, complex_partner_infos]))
+
+                # Add COMPLEX_MULTI events
+                if event_type in "Binding" and len(value) == 10:
+                    theme_id = (("EGID", value[0]), ("EGID", value[2]))
+                    complex_partner_id = ("EGID", value[4])
+                    confidence_score = float(value[6])
+                    question_type = EVEX_QUESTION_MAPPER[event_type] + "_MULTI"
+                    complex_partner = relations.setdefault(question_type, {})
+                    themes = complex_partner.setdefault(theme_id, {})
+                    themes.setdefault(complex_partner_id, [0, 0])
+                    if (complex_partner_id in themes and confidence_score > themes[complex_partner_id][0]) or (complex_partner_id not in themes):
+                        themes[complex_partner_id][0] = confidence_score
+                    themes[complex_partner_id][1] += 1
+
+                    # relations_verbose used for visualization
+                    subject_list = (question_type, theme_id)
+                    theme_infos = (value[1], value[3])  # Name, Start Position, End Position
+                    complex_partner_infos = value[5]
+                    relations_verbose.setdefault(subject_list, {})
+                    relations_verbose[subject_list].setdefault(complex_partner_id, {})
+                    relations_verbose[subject_list][complex_partner_id].setdefault(text_file, [set(), []])
+                    relations_verbose[subject_list][complex_partner_id][text_file][0].update([theme_infos[0][0], theme_infos[1][0]])
+                    relations_verbose[subject_list][complex_partner_id][text_file][1].append((confidence_score, [text_file, theme_infos, complex_partner_infos]))
+
+        return relations, relations_verbose
 
     @classmethod
     def _get_indra_relations(cls, mode):
@@ -158,12 +248,12 @@ class KnowledgeBaseEvaluator:
         # question_types = [Question.ACTIVATION_CAUSE]
         # question_types = [Question.PHOSPHORYLATION_CAUSE]
         logger.info("    **** Loading INDRA events")
-        for question_type in tqdm(question_types, desc="Iterate over all question types and load from groundtruth"):
+        for question_type in tqdm(question_types, desc="Iterate over all question types and load from groundtruth", disable=TQDM_DISABLE):
             stats_logging = False
             if question_type.name in ["PHOSPHORYLATION_CAUSE", "PHOSPHORYLATION_COMPLEXCAUSE"] or logger.level == logging.DEBUG:
                 stats_logging = True
                 logger.info(question_type)
-            _, event_dict = IndraDataLoader.get_dataset(mode=mode, question_type=question_type, biopax_model_str=PID_MODEL_FAMILIES)
+            _, event_dict = IndraDataLoader.get_dataset(mode=mode, question_type=question_type, biopax_model_str=OWL_STATEMENTS)
             subjects = list(event_dict.keys())
             counter_pairs = 0
             counter_pairs_with_ids = 0
@@ -174,7 +264,9 @@ class KnowledgeBaseEvaluator:
                 _, unique_answer_agents = IndraDataLoader.get_unique_args_statements(subject, statements, question_type)
 
                 # relations_verbose used for visualization
-                subject_list = tuple(get_subject_list(question_type.name, subject_agents))
+                subject_strings_list = get_subject_list(question_type.name, subject_agents)
+                entities_list = parse_subject_strings(subject_strings_list)
+                subject_list = (subject_strings_list[0], entities_list)
                 relations_verbose.setdefault(subject_list, {})
 
                 # Change DEPHOSPHORYLATION to PHOSPHORYLATION and INHIBEXPRESSION to EXPRESSION for evaluation purposes
@@ -245,6 +337,37 @@ class KnowledgeBaseEvaluator:
                             themes[("SITE", res_pos_str)] = [1, 1]
                             counter_pairs += 1
                             relations_verbose[subject_list].setdefault(("SITE", res_pos_str), {})
+                elif question_type.name.endswith("COMPLEX_PAIR"):
+                    theme_agent = subject_agents[0]
+                    theme_id = get_db_id(theme_agent)
+                    for cause_agent in unique_answer_agents:
+                        cause_id = get_db_id(cause_agent)
+                        counter_pairs += 1
+                        if cause_id[0] == "EGID" and cause_id[1] != "##" and theme_id[1] != "##":
+                            modification = relations.setdefault(question_type.name, {})
+                            themes = modification.setdefault(theme_id, {})
+                            themes[cause_id] = [1, 1]
+                            counter_pairs_with_ids += 1
+                            relations_verbose[subject_list].setdefault(cause_id, {})
+                elif question_type.name.endswith("COMPLEX_MULTI"):
+                    theme_ids = []
+                    themes = []
+                    for subject_agent in subject_agents:
+                        theme_agent = subject_agent
+                        theme_id = get_db_id(theme_agent)
+                        theme_ids.append(theme_id)
+                        themes.append(theme_id[1])
+                    if "##" in themes:
+                        continue
+                    for cause_agent in unique_answer_agents:
+                        cause_id = get_db_id(cause_agent)
+                        counter_pairs += 1
+                        if cause_id[0] == "EGID" and cause_id[1] != "##":
+                            modification = relations.setdefault(question_type.name, {})
+                            themes = modification.setdefault(tuple(theme_ids), {})
+                            themes[cause_id] = [1, 1]
+                            counter_pairs_with_ids += 1
+                            relations_verbose[subject_list].setdefault(cause_id, {})
 
             if stats_logging:
                 logger.info("Pairs (INDRA Groundtruth)")
@@ -291,9 +414,9 @@ class KnowledgeBaseEvaluator:
                             relation_list.append((themes, answer, float(confidence[0]), confidence[1]))
         else:
             for tmp_question_type in relation_dict.keys():
-                if question_type == " Simple" and "COMPLEX" in tmp_question_type:
+                if question_type == " Simple" and ("_COMPLEX" in tmp_question_type or "COMPLEX_MULTI" in tmp_question_type):
                     continue
-                elif question_type == " Complex" and "COMPLEX" not in tmp_question_type:
+                elif question_type == " Complex" and ("_COMPLEX" not in tmp_question_type and "COMPLEX_MULTI" not in tmp_question_type):
                     continue
                 for themes, cause_set in relation_dict[tmp_question_type].items():
                     for cause, confidence in cause_set.items():
@@ -420,18 +543,40 @@ class KnowledgeBaseEvaluator:
         return np.array(y_true), np.array(y_scores)
 
     @classmethod
-    def _get_performance_scores(cls, groundtruth_list, baseline_list, optional_list=None):
+    def _get_performance_scores(cls, groundtruth_list, baseline_list, optional_list=None, question_type=""):
         question_entity_set = set()
         groundtruth_set = set()
         baseline_set = set()
         evidence_counts_dict = {}
         evidence_counts = 0
         for example in groundtruth_list:
-            groundtruth_set.add((example[0], example[1]))
+            # Order is irrelevant for COMPLEX_PAIR and COMPLEX_MULTI
+            if question_type == "COMPLEX_PAIR":
+                groundtruth_set.add(tuple(sorted((example[0], example[1]))))
+            elif "COMPLEX_PAIR" in example[0]:
+                groundtruth_set.add(tuple(sorted((example[0][1:], example[1]))))
+            elif question_type == "COMPLEX_MULTI":
+                groundtruth_set.add(tuple(sorted(list(example[0]) + list((example[1], )))))
+            elif "COMPLEX_MULTI" in example[0]:
+                # print(example)
+                # print(example[0])
+                # print(example[1])
+                groundtruth_set.add(tuple(sorted(list(example[0][1:]) + list((example[1], )))))
+            else:
+                groundtruth_set.add((example[0], example[1]))
             question_entity_set.add(example[0])
         for example in baseline_list:
             if example[0] in question_entity_set:
-                baseline_set.add((example[0], example[1]))
+                if question_type == "COMPLEX_PAIR":
+                    baseline_set.add(tuple(sorted((example[0], example[1]))))
+                elif "COMPLEX_PAIR" in example[0]:
+                    baseline_set.add(tuple(sorted((example[0][1:], example[1]))))
+                elif question_type == "COMPLEX_MULTI":
+                    baseline_set.add(tuple(sorted(list(example[0]) + list((example[1], )))))
+                elif "COMPLEX_MULTI" in example[0]:
+                    baseline_set.add(tuple(sorted(list(example[0][1:]) + list((example[1], )))))
+                else:
+                    baseline_set.add((example[0], example[1]))
                 evidence_counts_dict.setdefault(example[3], 0)
                 evidence_counts_dict[example[3]] += 1
                 evidence_counts += example[3]
@@ -482,7 +627,7 @@ class KnowledgeBaseEvaluator:
         optional_list = self._get_relation_list(optional_dict, question_type) if optional_dict is not None else None
 
         y_true, y_scores = self._compare_relations(predictions_list, groundtruth_list, min_confidence)
-        recall_score, precision_score, f1_score, number_pred = self._get_performance_scores(groundtruth_list, predictions_list, optional_list)
+        recall_score, precision_score, f1_score, number_pred = self._get_performance_scores(groundtruth_list, predictions_list, optional_list, question_type)
 
         try:
             average_precision = average_precision_score(y_true, y_scores)
@@ -504,16 +649,26 @@ class KnowledgeBaseEvaluator:
 
 # Main
 if __name__ == "__main__":
+    from analysis.example_visualization import ExampleVisualizer
     # relations = get_all_evex_relations(use_cache=True)
     # relations = get_all_evex_standoff_relations()
     # logger.info("EVEX Predictions for EGID 729359: {}".format(relations["PHOSPHORYLATION_CAUSE"]['729359']))
     # logger.info("EVEX Predictions for EGIDs: {}".format(relations["PHOSPHORYLATION_CAUSE"]))
     logger.setLevel(logging.INFO)
-    kb_evaluator = KnowledgeBaseEvaluator(mode="test", standoff=True)
+
+    # Reconfigure logging again, this time with a file.
+    logging.basicConfig(handlers= [logging.FileHandler(root_path + '/logs/EVEX_TEST.txt'), logging.StreamHandler()], level=logging.INFO,
+                        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s", datefmt="%m/%d/%Y %H:%M:%S", force=True)
+
+    kb_evaluator = KnowledgeBaseEvaluator(mode="dev")
     question_types = [Question(number).name for number in QUESTION_TYPES_EVEX]
     question_types.append(" All")
     question_types.append(" Simple")
     question_types.append(" Complex")
     # question_types = [Question.PHOSPHORYLATION_CAUSE.name]
+    # question_types = [Question(44).name, Question(74).name]
     for question_type in question_types:
         kb_evaluator.calculate_average_precision(kb_evaluator.indra_dict, kb_evaluator.evex_dict, question_type)
+    
+    # visualizer = ExampleVisualizer(groundtruth_event_dict=kb_evaluator.indra_dict_verbose, prediction_event_dict=kb_evaluator.evex_dict_verbose)
+    # visualizer.visualize_predictions()

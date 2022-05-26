@@ -11,7 +11,7 @@ if root_path not in sys.path:
     sys.path.append(root_path)
 
 # from sklearn.metrics import average_precision_score
-from data_processing.datatypes import Question
+from data_processing.datatypes import Question, parse_subject_strings
 from configs import CACHE
 
 import baseline.evex_baseline as baseline
@@ -99,7 +99,12 @@ def convert_answers_from_docs_to_entities(dicts_by_pubmed_id, bool_normalized=Tr
             for tuples in pubmed_content:
                 doc_text = tuples[2]
                 for answer in tuples[1]:
-                    subject = tuple(tuples[0])
+
+                    # Parse subject entities
+                    question_type = tuples[0][0]
+                    theme_ids = parse_subject_strings(tuples[0])
+                    subject = (question_type, theme_ids)
+
                     if subject not in answer_dict:
                         answer_dict[subject] = {}
                     if debug_groundtruth is True:
@@ -115,8 +120,8 @@ def convert_answers_from_docs_to_entities(dicts_by_pubmed_id, bool_normalized=Tr
                         answer_dict[subject][object_id][1] += 1
                     else:
                         answer_dict[subject].setdefault(object_id, {})
-                        answer_dict[subject][object_id].setdefault(doc_id, [[], []])
-                        answer_dict[subject][object_id][doc_id][0].append(answer[0])
+                        answer_dict[subject][object_id].setdefault(doc_id, [set(), []])
+                        answer_dict[subject][object_id][doc_id][0].add(answer[0])
                         answer_dict[subject][object_id][doc_id][1].append((prob_score, doc_text))
 
     if bool_return_docs:
@@ -126,8 +131,6 @@ def convert_answers_from_docs_to_entities(dicts_by_pubmed_id, bool_normalized=Tr
     # TODO: Adjust for different question types
     entity_dict = {}
     for theme in answer_dict.keys():
-        # logger.warn(theme)
-        # input("Continue")
         if theme[0] in Question.__members__:
             question_type = str(theme[0])
             # DEPHOSPHORYLATION to PHOSPHORYLATION for evaluation purposes
@@ -140,34 +143,25 @@ def convert_answers_from_docs_to_entities(dicts_by_pubmed_id, bool_normalized=Tr
             elif question_type.startswith("INHIBITION"):
                 question_type = "STATECHANGE" + "_" + question_type.split("_")[-1]
             question_types = [question_type]
-            if not question_type.startswith("STATECHANGE") and not question_type.endswith("SITE"):
+            if not question_type.startswith("STATECHANGE") and not question_type.endswith("SITE") and not question_type.endswith("_PAIR") \
+                    and not question_type.endswith("_MULTI"):
                 question_types.append("STATECHANGE" + "_" + question_type.split("_")[-1])
             for current_question_type in question_types:
                 if current_question_type not in entity_dict:
                     entity_dict[current_question_type] = {}
-            theme_ids = []
             bool_numeric = True
-            for theme_subject in theme[1:]:
-                theme_id = theme_subject.split("_")[-1]
-                if theme_id.isnumeric():
-                    theme_id = ("EGID", theme_id)
-                elif theme_id != "##":
-                    theme_id = ("CHEBI", theme_id)
-                elif theme_id == "##":
-                    theme_id = ("##", theme_id)
-                    bool_numeric = False
-                else:
-                    raise ValueError("Unexpected theme id {}".format(theme_id))
-                theme_ids.append(theme_id)
-            if len(theme_ids) == 1:
-                theme_ids = theme_ids[0]
-            elif len(theme_ids) > 1:
-                theme_ids = tuple(theme_ids)
+            theme_entities = theme[1]
+            if type(theme_entities[0]) == str and theme_entities[1] == "##":
+                bool_numeric = False
+            elif type(theme_entities[0]) != str:
+                for theme_subject in theme_entities:
+                    if theme_subject[1] == "##":
+                        bool_numeric = False
             if bool_numeric:
                 for cause, confidence in answer_dict[theme].items():
                     if cause[0] in ["EGID", "CHEBI", "SITE"]:
                         for current_question_type in question_types:
-                            theme_in_dict = entity_dict[current_question_type].setdefault(theme_ids, {})
+                            theme_in_dict = entity_dict[current_question_type].setdefault(theme_entities, {})
                             if cause not in theme_in_dict:
                                 theme_in_dict[cause] = [0, 0]
                             if theme_in_dict[cause][0] < confidence[0]:
@@ -178,25 +172,24 @@ def convert_answers_from_docs_to_entities(dicts_by_pubmed_id, bool_normalized=Tr
 
 
 def visualize(groundtruth, predictions, indra_event_dict=None, top=True):
-    visualizer = visualization.ExampleVisualizer(groundtruth=groundtruth, predictions=predictions, indra_event_dict=indra_event_dict,
-                                                 groundtruth_type="indra")
+    visualizer = visualization.ExampleVisualizer(groundtruth=groundtruth, predictions=predictions, groundtruth_event_dict=indra_event_dict)
     # Table with occurrences of all entities
     # visualizer.visualize_entities()
-    question_subject = None
-    # question_subject = ('PHOSPHORYLATION_CAUSE', 'MAPK8_SUBSTRATE_EGID_5599')
-    # visualizer.visualize_entity(question_subject)
+    question_subjects = None
+    # question_subjects = [('PHOSPHORYLATION_CAUSE', 'MAPK8_SUBSTRATE_EGID_5599')]
+    # visualizer.visualize_entity(question_subjects)
     if top:
         # logger.info("All predictions")
         # visualizer.visualize_predictions(mode="all")
         # logger.info("True positives")
-        # visualizer.visualize_predictions(mode="true_positives", question_subject=question_subject)
+        # visualizer.visualize_predictions(mode="true_positives", question_subjects=question_subjects)
         logger.info("False positives - Random (Analysis of new predictions)", )
-        visualizer.visualize_predictions(mode="false_positives", number=50, sampling_method="top", question_subject=question_subject, evidence_preds=False)
+        visualizer.visualize_predictions(mode="false_positives", number=10, question_subjects=question_subjects)
         # logger.info("False negatives")
         # visualizer.visualize_predictions(mode="false_negatives")
         logger.info(" ===================================================================== ")
-        logger.info("All - Random (Estimation of Precision) ")
-        visualizer.visualize_predictions(mode="all", number=250, sampling_method="random", question_subject=question_subject, evidence_preds=False)
+        logger.info("All - Random (Estimation of Sample Precision) ")
+        visualizer.visualize_predictions(mode="all", number=10, question_subjects=question_subjects)
     else:
         groundtruth_subjects, predictions_subjects = visualizer.get_entity_questions()
         logger.info("Groundtruth Subjects")
@@ -206,13 +199,13 @@ def visualize(groundtruth, predictions, indra_event_dict=None, top=True):
         visualizer.visualize_entity(predictions_subjects[0])
 
 
-def get_average_precision(groundtruth, predictions, mode, use_db_ids=False, visualize_bool=False):
+def get_average_precision(groundtruth, predictions, mode, use_db_ids=False, visualize_bool=False, only_visualize=False):
     ''' Calculate average precision for Query and its answers. One score for one question type. '''
 
     groundtruth_dict, _ = convert_answers_from_docs_to_entities(groundtruth, use_db_ids, debug_groundtruth=True)
     prediction_dict, _ = convert_answers_from_docs_to_entities(predictions, use_db_ids)
 
-    kb_evaluator = baseline.KnowledgeBaseEvaluator(groundtruth_dict, prediction_dict, mode=mode, standoff=True)
+    kb_evaluator = baseline.KnowledgeBaseEvaluator(groundtruth_dict, prediction_dict, mode=mode)
     question_types = list(groundtruth_dict.keys())
     if len(question_types) == 0:
         question_types = list(prediction_dict.keys())
@@ -224,6 +217,9 @@ def get_average_precision(groundtruth, predictions, mode, use_db_ids=False, visu
     logger.info(" Analysis of Predictions ")
     if len(predictions) > 0 and visualize_bool:
         visualize(groundtruth, predictions, kb_evaluator.indra_dict_verbose)
+        if only_visualize:
+            yield
+            return
 
     logger.info("____")
     logger.info("    **** Best possible results (Groundtruth INDRA vs Groundtruth Annotations)")

@@ -40,8 +40,11 @@ class DistantBertDataset(Dataset):
         return sample
 
     def truncate(self, size):
-        if len(self.features) > 0 and len(self.features[0].input_ids) > size:
-            for i in range(len(self.features)):
+        # for feature in self.features:
+        #     logger.info(torch.tensor(feature.input_ids, dtype=torch.long).size())
+        #     logger.info(len(feature.input_ids))
+        for i in range(len(self.features)):
+            if len(self.features) > 0 and len(self.features[i].input_ids) > size:
                 self.features[i].input_ids = self.features[i].input_ids[:size]
                 self.features[i].input_mask = self.features[i].input_mask[:size]
                 self.features[i].segment_ids = self.features[i].segment_ids[:size]

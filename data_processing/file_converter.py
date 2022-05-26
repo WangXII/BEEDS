@@ -1,4 +1,4 @@
-""" Converts the .a* files from the BioNLP challenges to our custom .iob format """
+""" Generates question and answer for input to the model """
 
 import os
 import sys
@@ -31,6 +31,19 @@ def generate_question(entities, question_type):
     elif question_type.name.endswith("_SITE"):
         modification_type = question_type.name.split("_")[0].lower()
         question_string = "What are {} sites in ".format(modification_type)
+    elif question_type.name.endswith("COMPLEX_PAIR"):
+        question_string = "What binds/is in complex with "
+    elif question_type.name.endswith("COMPLEX_MULTI"):
+        question_string = "What binds/is in complex with "
+        for i, entity in enumerate(entities[1]):
+            if i + 1 == len(entities[1]) and i > 0:
+                question_string += "or {} ".format(entity)
+            elif i + 1 == len(entities[1]) and i == 0:
+                question_string += "{} ".format(entity)
+            else:
+                question_string += "{}, ".format(entity)
+        modification_type = question_type.name.split("_")[0].lower()
+        question_string += "and {} ".format(modification_type)
     elif question_type.name.endswith("COMPLEXCAUSE"):
         question_string = "What binds/is in complex with "
         for i, entity in enumerate(entities[1]):
@@ -143,7 +156,7 @@ def apply_entity_blinding(doc_string, tokenizer, blinded_entity_dict=None, id_pe
 
 
 def get_word_tokenization_position(doc_string, model_helper, blind_doc=False, blinded_entity_dict=None, id_permutation=None):
-    """ Reads the file line by line
+    """ Reads the file line by line and returns start and end character for each token
     Parameters
     ----------
     doc_str : str
@@ -158,7 +171,7 @@ def get_word_tokenization_position(doc_string, model_helper, blind_doc=False, bl
     Returns
     -------
     list
-        List of all tokens as the following list: [token, tag, whitestart_character, end_character]
+        List of all tokens as the following list: [token, start_character, end_character]
     """
 
     words = []

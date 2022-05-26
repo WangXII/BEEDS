@@ -22,14 +22,20 @@ from tqdm import trange
 from typing import List
 
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler
-from torch._six import container_abcs
+TORCH_MAJOR = int(torch.__version__.split('.')[0])
+TORCH_MINOR = int(torch.__version__.split('.')[1])
+if TORCH_MAJOR == 1 and TORCH_MINOR < 8:  # https://stackoverflow.com/questions/70193443/colab-notebook-cannot-import-name-container-abcs-from-torch-six
+    from torch._six import container_abcs, int_classes
+else:
+    import collections.abc as container_abcs
+    int_classes = int
 from transformers import get_linear_schedule_with_warmup
 
 # from data_processing.datatypes import LABELS
-from metrics.sequence_labeling import get_entities_with_names
-from data_processing.nn_output_to_indra import get_db_xrefs, make_indra_statements
+from configs import TQDM_DISABLE
+from data_processing.nn_output_to_indra import NameToDBID, make_indra_statements
 from data_processing.datatypes import PAD_TOKEN_LABEL_ID
-from configs import PUBMED_EVIDENCE_ANNOTATIONS_DB
+from metrics.sequence_labeling import get_entities_with_names
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -174,6 +180,40 @@ def highlight_text(tokens: List[str], answer_list: List[tuple]) -> str:
     return pubmed_text
 
 
+class TextHighlighter:
+    def __init__(self):
+        self.doc_cache = {}
+
+    def highlight_text(self, file_name, subjects, answer):
+        file_name = file_name[:-4] + ".txt" # Change suffix from .ann to .txt
+        text = ""
+        if type(subjects[0]) == tuple:
+            entities = sorted(list(subjects) + [answer], key=lambda x: x[1])
+        else:
+            entities = sorted([subjects, answer], key=lambda x: x[1])
+        if file_name in self.doc_cache:
+            file_txt = self.doc_cache[file_name]
+        else:
+            with open(file_name) as file:
+                file_txt = file.read()
+                self.doc_cache[file_name] = file_txt
+        current_position = 0
+        for entity in entities:
+            filler = "----"
+            if entity == answer:
+                filler = "===="
+            text += file_txt[current_position:int(entity[1])] + filler + file_txt[int(entity[1]):int(entity[2])] + filler  # Entity start to end
+            current_position = int(entity[2])
+        text += file_txt[current_position:]
+
+        # Truncate text
+        min_char_position = int(entities[0][1])
+        max_char_position = int(entities[-1][2])
+        text = text[max(0, min_char_position - 256):min(len(text), max_char_position + 256)]
+
+        return text
+
+
 def extract_from_nn_output(labels, out_label_ids, preds, all_preds, out_token_ids, attention_masks, whitespace_bools, position_ids,
                            tokenizer, pubmed_ids, subjects, question_ids, subject_lengths, question_types, out_debug_label_ids, model, args):
 
@@ -231,8 +271,8 @@ def extract_from_nn_output(labels, out_label_ids, preds, all_preds, out_token_id
     # out_label_list = list(out_label_dict.values())
     # preds_list = list(preds_dict.values())
 
-    pubmed_engine = create_engine(PUBMED_EVIDENCE_ANNOTATIONS_DB)
-    for i in trange(len(out_label_dict), desc="Extract Entities"):
+    logger.info("Extract Entities")
+    for i in trange(len(out_label_dict), desc="Extract Entities", disable=TQDM_DISABLE):
         if len(out_label_dict[i]) == 0:
             # Padding sequence
             continue
@@ -240,9 +280,9 @@ def extract_from_nn_output(labels, out_label_ids, preds, all_preds, out_token_id
         answer_list = get_entities_with_names(token_dict[i], preds_dict[i], whitespace_dict[i], position_dict[i], question_types[i])
 
         # Add DB xrefs to groundtruth_list and answer_list if possible
-        groundtruth_db_list = get_db_xrefs(groundtruth_list, pubmed_list[i], pubmed_engine, use_simple_normalizer=args.use_simple_normalizer)
+        groundtruth_db_list = NameToDBID.get_db_xrefs(groundtruth_list, pubmed_list[i], use_simple_normalizer=args.use_simple_normalizer)
         groundtruth_probs_list = get_answer_probs(groundtruth_list, groundtruth_db_list, all_preds[i], attention_masks[i], model, args, answer_start_dict[i])
-        db_list = get_db_xrefs(answer_list, pubmed_list[i], pubmed_engine, use_simple_normalizer=args.use_simple_normalizer)
+        db_list = NameToDBID.get_db_xrefs(answer_list, pubmed_list[i], use_simple_normalizer=args.use_simple_normalizer)
         answer_probs_list = get_answer_probs(answer_list, db_list, all_preds[i], attention_masks[i], model, args, answer_start_dict[i])
 
         # Extract highlighted Pubmed text
@@ -285,13 +325,20 @@ def extract_from_nn_output(labels, out_label_ids, preds, all_preds, out_token_id
     return groundtruth, predictions, out_label_dict, preds_dict, indra_preds, debug_scores
 
 
-def initialize_loaders(args, dataset, optimizer, n_gpu):
+def initialize_loaders(args, dataset, direct_dataset, optimizer):
     sampler = RandomSampler(dataset) if args.local_rank == -1 else DistributedSampler(dataset)
     dataloader = DataLoader(dataset, sampler=sampler, batch_size=1, collate_fn=collate_fn, pin_memory=True)
-    total = len(dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
+    direct_sampler = RandomSampler(direct_dataset) if args.local_rank == -1 else DistributedSampler(dataset)
+    direct_dataloader = DataLoader(direct_dataset, sampler=direct_sampler, batch_size=1, collate_fn=collate_fn, pin_memory=True)
+    total = 0
+    if args.use_directly_supervised_data:
+        total += len(direct_dataloader)
+    elif args.use_dstantly_supervised_data:
+        total += len(direct_dataloader)
+    total = total // args.gradient_accumulation_steps * args.num_train_epochs
     warmup_steps = int(args.warmup_proportion * total)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total)
-    return dataloader, scheduler
+    return dataloader, direct_dataloader, scheduler
 
 
 def collate_fn(batch):

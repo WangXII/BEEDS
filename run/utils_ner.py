@@ -138,7 +138,7 @@ def generate_examples(annotation_data, question_type):
     return examples, all_subjects
 
 
-def convert_examples_to_features(examples, label_list, max_seq_length, doc_stride, retrieval_size, model_helper,
+def convert_examples_to_features(examples, label_list, max_seq_length, batch_size, model_helper,
                                  pad_token=0, pad_token_segment_id=0, pad_token_label_id=-1, sequence_a_segment_id=0,
                                  sequence_b_segment_id=1, mask_padding_with_zero=True, subject_list=[]):
     """ Loads a data file into a list of `InputBatch`s
@@ -255,7 +255,7 @@ def convert_examples_to_features(examples, label_list, max_seq_length, doc_strid
             sample_features.question_type.append(ds_sample.question_type_vec[ex_index])
 
         # Pad each sample_features to retrieval size
-        while len(sample_features.input_ids) < retrieval_size:
+        while len(sample_features.input_ids) < batch_size:
             sample_features.input_ids.append([pad_token] * max_seq_length)
             sample_features.input_ids_blinded.append([pad_token] * max_seq_length)
             sample_features.input_mask.append([0 if mask_padding_with_zero else 1] * max_seq_length)

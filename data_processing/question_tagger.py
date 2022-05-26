@@ -224,7 +224,7 @@ def get_relevant_answers(main_answer_pos, other_answers_pos, question_ans_pos, s
 
 
 def tag_question_with_given_answers(context, context_blinded, answers, main_answers, question_length, max_seq_length,
-                                    limit_max_length, substrate_first_idx, model_name_or_path):
+                                    limit_max_length, model_name_or_path):
     ''' Tag question with given answer positions. Tagging all main answers is used for debugging purposes later.  '''
 
     # Tagged Answer Tuple (token, answer_tag, ws_bool, pos_start, pos_end, debug_tag, token_entity_blinded)
@@ -238,6 +238,7 @@ def tag_question_with_given_answers(context, context_blinded, answers, main_answ
     # Variables for debug answers (later used in wandb histogram)
     debug_t = 0  # Current Event/Answer Index
     debug_state = 0  # 0 for 'O' and 'I', 1 for 'B'
+    first_answer_index_w = 0
     # try:
     #     assert len(context) == len(context_blinded)
     # except AssertionError:
@@ -274,6 +275,8 @@ def tag_question_with_given_answers(context, context_blinded, answers, main_answ
             at_least_one_answer = True
             answer_tag = 'B'
             state = 1
+            if first_answer_index_w == -1:
+                first_answer_index_w = w
         else:
             answer_tag = 'O'
             state = 0
@@ -306,9 +309,11 @@ def tag_question_with_given_answers(context, context_blinded, answers, main_answ
         tagged_answer.append((word[0], answer_tag, whitespace, word[1], word[2], debug_tag, context_blinded[w][0]))
 
     # We need to truncate the sequence
+    truncated = False
     if limit_max_length and (question_length + len(tagged_answer) + 1 > max_seq_length):
+        truncated = True
         available_answer_len = max_seq_length - question_length - 1
-        left_most_sentence_index = bisect.bisect_left(sentence_pos, substrate_first_idx - int(available_answer_len / 4))
+        left_most_sentence_index = bisect.bisect_left(sentence_pos, first_answer_index_w - int(available_answer_len / 4))
         # print(current_sentence_pos)
         # print(left_most_sentence_index)
         if left_most_sentence_index == len(sentence_pos):
@@ -320,11 +325,11 @@ def tag_question_with_given_answers(context, context_blinded, answers, main_answ
             answer_start = answer_end - available_answer_len
         tagged_answer = tagged_answer[answer_start:answer_end]
 
-    return tagged_answer, at_least_one_answer
+    return tagged_answer, at_least_one_answer, truncated
 
 
 def tag_question_detailed(document_text, model_helper, main_answers, other_answers, question_ans, question_sub, question_str,
-                          pubmed_id=-1, max_seq_length=384, limit_max_length=False, tagging_mode="detailed"):
+                          pubmed_id=-1, max_seq_length=384, limit_max_length=True, tagging_mode="detailed"):
     """ Tags all event arguments in a detailed way. Only tag answer entities next to question entities.
         If the trigger and substrate are in same two sentences, find nearest enzyme in the same sentence
         or in the sentence next to it. Otherwise skip marking the answer as correct.
@@ -341,7 +346,7 @@ def tag_question_detailed(document_text, model_helper, main_answers, other_answe
     question_ans : list of list
         List of synonynms relevant for the question entities
     question_sub: list
-        Subjects of the question. Same as question_ans but only containing the prefered name
+        Subjects of the question. Example = ['CLIP1_SUBSTRATE_EGID_6249']
     question_str : list of str
         String of the question.
     pubmed_id: long
@@ -421,22 +426,21 @@ def tag_question_detailed(document_text, model_helper, main_answers, other_answe
     logger.info(answers)
 
     # Find earliest occurence of substrate entity in question_str (on word basis, not character)
-    indexes = []
-    for substrate_synonym in question_ans[0]:
-        substrate_tokens = model_helper.tokenizer.tokenize(substrate_synonym)
-        np_tokens = np.array(question_tokens, dtype=object)
-        candidate_indexes = np.where(np_tokens == substrate_tokens[0])[0]
-        for ind in candidate_indexes:
-            if question_tokens[ind: ind + len(substrate_tokens)] == substrate_tokens:
-                indexes.append(ind)
-    if len(indexes) == 0:
-        earliest_index = 0
-    else:
-        earliest_index = min(indexes)
+    # indexes = []
+    # for substrate_synonym in question_ans[0]:
+    #     substrate_tokens = model_helper.tokenizer.tokenize(substrate_synonym)
+    #     np_tokens = np.array(question_tokens, dtype=object)
+    #     candidate_indexes = np.where(np_tokens == substrate_tokens[0])[0]
+    #     for ind in candidate_indexes:
+    #         if question_tokens[ind: ind + len(substrate_tokens)] == substrate_tokens:
+    #             indexes.append(ind)
+    # if len(indexes) == 0:
+    #     earliest_index = 0
+    # else:
+    #     earliest_index = min(indexes)
 
-    tagged_answer, at_least_one_answer = tag_question_with_given_answers(
-        context, context_blinded, answers, main_answers, question_length, max_seq_length, limit_max_length, earliest_index,
-        model_helper.model_name_or_path)
+    tagged_answer, at_least_one_answer, truncated = tag_question_with_given_answers(
+        context, context_blinded, answers, main_answers, question_length, max_seq_length, limit_max_length, model_helper.model_name_or_path)
     # logger.info("Final document tagged:")
     # logger.info(tagged_answer)
     # if at_least_one_answer:
@@ -452,6 +456,94 @@ def tag_question_detailed(document_text, model_helper, main_answers, other_answe
     # exit()
 
     return tagged_question, at_least_one_answer, question_length
+
+def tag_question_directly_supervised(document_text, model_helper, answers, question_sub, question_str, pubmed_id=-1,
+                                     max_length=384, limit_max_length=True):
+    """ Tags all event arguments for a directly supervised question.
+    Parameters
+    ----------
+    document_text : str
+        String of the document text.
+    model_helper : ModelHelper
+        ModelHelper containing both the AutoTokenizer and the model_name_or_path
+    answers : list of tuples
+        Answers in the given document_text with start and end position
+    question_sub: list
+        Subjects of the question. Example = ['PHOSPHORYLATION_CAUSE', 'CLIP1_SUBSTRATE_EGID_6249']
+    question_str : list of str
+        String of the question.
+    pubmed_id: long
+        PubMed ID of the corresponding question
+    max_length: int
+        maximum sequence length
+    limit_max_length: whether to limit maximum sequence length
+
+    Returns
+    -------
+    list
+        The annotated events by BERT in IOB format (token), whether a whitespace is after,
+        and start and end positions of the tokens. No checking for maximum sequence length done here
+    """
+
+    # Tokenize the text into a list of Tuples (token, start_index, end_index) and the question into list of token
+    if "berta" in model_helper.model_name_or_path:
+        question_str = " " + question_str
+    question_tokens = model_helper.tokenizer.tokenize(question_str)
+    context = get_word_tokenization_position(document_text, model_helper)
+
+    # Apply entity blinding
+    question_str_blinded, blinded_entity_dict, id_permutations = apply_entity_blinding(question_str, model_helper.tokenizer)
+    question_tokens_blinded = model_helper.tokenizer.tokenize(question_str_blinded)
+    context_blinded = get_word_tokenization_position(document_text, model_helper, True, blinded_entity_dict, id_permutations)
+
+    # Assert same token lengths for entity blinding and not
+    try:
+        assert len(question_tokens) == len(question_tokens_blinded)
+    except AssertionError:
+        logger.warning(len(question_tokens))
+        logger.warning(len(question_tokens_blinded))
+        logger.warning(list(itertools.zip_longest(question_tokens, question_tokens_blinded)))
+        raise AssertionError
+    try:
+        assert len(context) == len(context_blinded)
+    except AssertionError:
+        logger.warning(len(context))
+        logger.warning(len(context_blinded))
+        logger.warning(list(itertools.zip_longest(context, context_blinded)))
+        raise AssertionError
+
+    tagged_question = [pubmed_id, question_sub]
+    tagged_question.append((model_helper.tokenizer.cls_token, 'O', False, -1, -1, 'O', model_helper.tokenizer.cls_token))
+    for i, token in enumerate(question_tokens):
+        tagged_question.append((token, 'O', False, -1, -1, 'O', question_tokens_blinded[i]))
+    tagged_question.append((model_helper.tokenizer.sep_token, 'O', False, -1, -1, 'O', model_helper.tokenizer.sep_token))
+    if "roberta" in model_helper.model_name_or_path:
+        tagged_question.append((model_helper.tokenizer.sep_token, 'O', False, -1, -1, 'O', model_helper.tokenizer.sep_token))
+    question_length = len(tagged_question)
+
+    tagged_answer, _, truncated = tag_question_with_given_answers(
+        context, context_blinded, answers, answers, question_length, max_length, limit_max_length, model_helper.model_name_or_path)
+    # logger.info("Final document tagged:")
+    # logger.info(tagged_answer)
+    # if at_least_one_answer:
+    #     logger.warning(document_text)
+    #     logger.warning(answers)
+    if truncated:
+        logger.info(document_text)
+        logger.info(question_str)
+        logger.info(answers)
+        logger.info(tagged_answer)
+        logger.info(pubmed_id)
+
+    question_length = len(tagged_question)
+    tagged_question = tagged_question + tagged_answer
+    tagged_question.append((model_helper.tokenizer.sep_token, 'O', False, -1, -1, 'O', model_helper.tokenizer.sep_token))
+
+    logger.info("Length tagged sequence with question:")
+    logger.info(len(tagged_question))
+    # exit()
+
+    return tagged_question
 
 
 # Main
